@@ -8,6 +8,9 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
 /**
@@ -49,15 +52,22 @@ public class GroupCoordinator implements AutoCloseable {
     private Map<Partition, String> ownership = Map.of();
     private final List<OwnershipInterval> ownershipHistory = new ArrayList<>();
 
+    private final ScheduledExecutorService expiryScheduler;
+
     private GroupState state = GroupState.EMPTY;
     private int generation = 0;
 
+    /** Production constructor: uses the wall clock and runs background expiry checks. */
     public GroupCoordinator(CoordinatorConfig config) {
-        this(config, System::currentTimeMillis);
+        this(config, System::currentTimeMillis, true);
     }
 
-    /** Test constructor with injectable clock (millis). */
+    /** Test constructor with injectable clock (millis); expiry checks are manual. */
     public GroupCoordinator(CoordinatorConfig config, LongSupplier clock) {
+        this(config, clock, false);
+    }
+
+    private GroupCoordinator(CoordinatorConfig config, LongSupplier clock, boolean autoExpiry) {
         this.config = config;
         this.clock = clock;
         this.store = new OffsetCommitStore(config.offsetStorePath());
@@ -66,6 +76,25 @@ public class GroupCoordinator implements AutoCloseable {
             ps.add(new Partition(config.topic(), i));
         }
         this.partitions = List.copyOf(ps);
+        if (autoExpiry) {
+            expiryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "group-coordinator-expiry");
+                t.setDaemon(true);
+                return t;
+            });
+            expiryScheduler.scheduleWithFixedDelay(this::checkExpirationsSafely,
+                    config.heartbeatIntervalMs(), config.heartbeatIntervalMs(), TimeUnit.MILLISECONDS);
+        } else {
+            expiryScheduler = null;
+        }
+    }
+
+    private void checkExpirationsSafely() {
+        try {
+            checkExpirations();
+        } catch (RuntimeException ignored) {
+            // Expiry checks must never kill the scheduler thread.
+        }
     }
 
     public CoordinatorConfig config() {
@@ -259,6 +288,9 @@ public class GroupCoordinator implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+        if (expiryScheduler != null) {
+            expiryScheduler.shutdownNow();
+        }
         store.close();
     }
 }
