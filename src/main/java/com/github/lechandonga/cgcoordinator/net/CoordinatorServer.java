@@ -239,6 +239,10 @@ public class CoordinatorServer implements AutoCloseable {
         return Protocol.ok(Long.toString(s.generation()), s.state(), detail);
     }
 
+    public GroupCoordinator getCoordinator() {
+        return coordinator;
+    }
+
     public int boundPort() {
         ServerSocket ss = serverSocket;
         return ss == null ? requestedPort : ss.getLocalPort();

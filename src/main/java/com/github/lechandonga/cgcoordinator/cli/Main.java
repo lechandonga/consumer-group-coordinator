@@ -8,6 +8,7 @@ import com.github.lechandonga.cgcoordinator.group.GroupCoordinator;
 import com.github.lechandonga.cgcoordinator.net.CoordinatorServer;
 import com.github.lechandonga.cgcoordinator.offset.FileOffsetStore;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -94,25 +95,48 @@ public final class Main {
         long joinMs = Long.parseLong(p.getOrDefault("join-ms", "5000"));
 
         try (ConsumerClient client = new ConsumerClient(host, port, member)) {
-            var assigned = client.join(joinMs);
             client.startHeartbeat(heartbeatMs);
+            client.join(joinMs);
+            // Let the initial membership burst settle into one stable
+            // generation before consuming, so we don't process an assignment
+            // that is about to be revoked.
+            try {
+                Thread.sleep(Math.max(joinMs, 1L));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            List<Integer> assigned = client.join(joinMs);
             System.out.println(member + " joined generation " + client.generation()
                     + " partitions=" + assigned);
-            for (int p0 : assigned) {
-                long offset = Math.max(0, client.fetchOffset(p0));
-                long end = offset + messages;
-                for (long o = offset; o < end; o++) {
-                    // "consume": in this reference implementation processing is a no-op.
-                    var result = client.commit(p0, o + 1);
-                    if (!result.accepted()) {
-                        System.err.println(member + " commit rejected: " + result.rejectReason()
-                                + " gen=" + client.generation() + " partition=" + p0);
-                        break;
+            long produced = 0;
+            // Consume across generations; whenever the heartbeat signals a
+            // rebalance, re-join and switch to the new assignment.
+            while (produced < messages) {
+                for (int p0 : client.partitions()) {
+                    long offset = Math.max(0, client.fetchOffset(p0));
+                    for (long o = offset; o < offset + messages && produced < messages; o++) {
+                        if (client.needsRejoin()) {
+                            break;
+                        }
+                        // "consume": processing is a no-op in this reference impl.
+                        var result = client.commit(p0, o + 1);
+                        if (!result.accepted()) {
+                            // fencing: drop this generation's work and re-join
+                            System.err.println(member + " commit rejected: "
+                                    + result.rejectReason() + " gen=" + client.generation()
+                                    + " partition=" + p0 + " -> re-joining");
+                            break;
+                        }
+                        produced++;
                     }
                     if (client.needsRejoin()) {
-                        client.join(joinMs);
-                        o = Math.max(o, client.fetchOffset(p0) - 1);
+                        break;
                     }
+                }
+                if (client.needsRejoin() || produced < messages) {
+                    client.join(joinMs);
+                    System.out.println(member + " now generation " + client.generation()
+                            + " partitions=" + client.partitions());
                 }
             }
             client.leave();
