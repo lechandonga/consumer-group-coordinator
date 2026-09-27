@@ -13,5 +13,12 @@ public enum RejectionReason {
     /** The member does not own the partition in the current generation. */
     NOT_OWNER,
     /** The committed offset would move the position backwards. */
-    OFFSET_REGRESSION
+    OFFSET_REGRESSION,
+    /**
+     * The caller's instance identity (instance token) is no longer current for
+     * its member id: a newer instance has taken over the identity, or this
+     * instance has been evicted. The request is fenced and must not be retried
+     * by this instance.
+     */
+    FENCED_INSTANCE
 }
