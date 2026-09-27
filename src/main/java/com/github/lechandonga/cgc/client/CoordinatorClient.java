@@ -70,7 +70,7 @@ public final class CoordinatorClient implements Closeable {
         String line = request(
                 "HEARTBEAT\t" + memberId + "\t" + instanceToken + "\t" + generation);
         String[] f = split(line);
-        expect(f, "OK", "HB", 3);
+        expect(f, "OK HB", 3);
         int gen = Integer.parseInt(f[1]);
         return new HeartbeatResponse(gen, parsePartitions(f[2]));
     }
@@ -100,8 +100,8 @@ public final class CoordinatorClient implements Closeable {
             throw new IllegalStateException("FETCH cannot be rejected", e);
         }
         String[] f = split(line);
-        expect(f, "OK", "COMMITTED", 3);
-        return Long.parseLong(f[2]);
+        expect(f, "OK COMMITTED", 2);
+        return Long.parseLong(f[1]);
     }
 
     public void ping() throws IOException {
@@ -130,6 +130,9 @@ public final class CoordinatorClient implements Closeable {
         if (response == null) {
             throw new IOException("coordinator closed the connection");
         }
+        if (!response.isEmpty() && response.charAt(response.length() - 1) == '\r') {
+            response = response.substring(0, response.length() - 1);
+        }
         if (response.startsWith("ERR\t") || response.startsWith("ERR ")) {
             throw toException(response);
         }
@@ -138,7 +141,12 @@ public final class CoordinatorClient implements Closeable {
 
     private JoinResult parseJoin(String line) throws IOException {
         String[] f = split(line);
-        expect(f, "OK", "JOIN", 6);
+        // Token f0="OK JOIN"; STABLE responses also carry a 6th field (partition
+        // id csv); IN_PROGRESS responses leave it empty.
+        if (f.length < 5) {
+            throw new IOException("bad join response: " + line);
+        }
+        expectPrefix(f, "OK JOIN");
         JoinStatus status;
         try {
             status = JoinStatus.valueOf(f[1]);
@@ -148,7 +156,8 @@ public final class CoordinatorClient implements Closeable {
         int gen = Integer.parseInt(f[2]);
         String token = f[3];
         boolean byTimeout = "1".equals(f[4]);
-        Set<Partition> partitions = status == JoinStatus.STABLE ? parsePartitions(f[5]) : Set.of();
+        String csv = f.length >= 6 ? f[5] : "";
+        Set<Partition> partitions = status == JoinStatus.STABLE ? parsePartitions(csv) : Set.of();
         return new JoinResult(status, gen, token, partitions, byTimeout);
     }
 
@@ -166,9 +175,14 @@ public final class CoordinatorClient implements Closeable {
         return line.split("\t", -1);
     }
 
-    private static void expect(String[] f, String tag, String op, int minFields)
-            throws IOException {
-        if (f.length < minFields || !tag.equals(f[0]) || !op.equals(f[1])) {
+    private static void expectPrefix(String[] f, String token) throws IOException {
+        if (f.length < 1 || !token.equals(f[0])) {
+            throw new IOException("unexpected response: " + String.join("\t", f));
+        }
+    }
+
+    private static void expect(String[] f, String token, int minFields) throws IOException {
+        if (f.length < minFields || !token.equals(f[0])) {
             throw new IOException("unexpected response: " + String.join("\t", f));
         }
     }

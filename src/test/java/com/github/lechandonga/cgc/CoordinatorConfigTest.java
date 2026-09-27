@@ -36,9 +36,19 @@ class CoordinatorConfigTest {
     }
 
     @Test
-    void rebalanceTimeoutBelowSessionTimeoutRejected() {
+    void rebalanceTimeoutBelowTwoHeartbeatsRejected() {
+        // heartbeat=100 -> rebalanceTimeout must be >= 200 and is independent
+        // of sessionTimeout (here 1000), so a small bound with a long session
+        // is legal while a sub-two-heartbeat bound is rejected.
         assertThrows(IllegalArgumentException.class,
-                () -> new CoordinatorConfig("topic", 4, 100, 1000, 500, dir.resolve("o.log")));
+                () -> new CoordinatorConfig("topic", 4, 100, 1000, 150, dir.resolve("o.log")));
+    }
+
+    @Test
+    void rebalanceTimeoutMayBeSmallerThanSessionTimeout() {
+        // Short rebalance bound, long session: independently tunable.
+        assertDoesNotThrow(
+                () -> new CoordinatorConfig("topic", 4, 100, 1000, 200, dir.resolve("o2.log")));
     }
 
     @Test

@@ -32,10 +32,11 @@ public record CoordinatorConfig(
                     "sessionTimeoutMs (" + sessionTimeoutMs + ") must be >= 2 * heartbeatIntervalMs ("
                             + heartbeatIntervalMs + ")");
         }
-        if (rebalanceTimeoutMs < sessionTimeoutMs) {
+        if (rebalanceTimeoutMs < 2 * heartbeatIntervalMs) {
             throw new IllegalArgumentException(
-                    "rebalanceTimeoutMs (" + rebalanceTimeoutMs + ") must be >= sessionTimeoutMs ("
-                            + sessionTimeoutMs + ")");
+                    "rebalanceTimeoutMs (" + rebalanceTimeoutMs
+                            + ") must be >= 2 * heartbeatIntervalMs (" + heartbeatIntervalMs
+                            + "); it is independent of sessionTimeoutMs");
         }
     }
 
