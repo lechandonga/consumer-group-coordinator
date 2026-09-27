@@ -10,6 +10,11 @@ public enum RejectionReason {
     ILLEGAL_GENERATION,
     /** A rebalance is being computed; requests must be retried afterwards. */
     REBALANCE_IN_PROGRESS,
+    /**
+     * The member instance was replaced by a newer instance of the same member
+     * id: the caller's member epoch is fenced and must stop, not retry.
+     */
+    FENCED_MEMBER_EPOCH,
     /** The member does not own the partition in the current generation. */
     NOT_OWNER,
     /** The committed offset would move the position backwards. */

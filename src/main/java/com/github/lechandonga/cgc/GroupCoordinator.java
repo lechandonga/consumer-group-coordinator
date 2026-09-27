@@ -34,9 +34,11 @@ public class GroupCoordinator implements AutoCloseable {
     }
 
     private static final class MemberInfo {
+        final long epoch;
         long lastHeartbeatMs;
 
-        MemberInfo(long now) {
+        MemberInfo(long epoch, long now) {
+            this.epoch = epoch;
             this.lastHeartbeatMs = now;
         }
     }
@@ -56,6 +58,7 @@ public class GroupCoordinator implements AutoCloseable {
 
     private GroupState state = GroupState.EMPTY;
     private int generation = 0;
+    private long nextMemberEpoch = 0;
 
     /** Production constructor: uses the wall clock and runs background expiry checks. */
     public GroupCoordinator(CoordinatorConfig config) {
@@ -105,19 +108,31 @@ public class GroupCoordinator implements AutoCloseable {
      * Registers a member (or refreshes an existing one) and, for new members,
      * triggers a rebalance. Returns the current generation and the member's
      * assignment after any rebalance has completed.
+     *
+     * <p>Every join issues a fresh member epoch: if another instance of the
+     * same member id is still live, it is fenced from this point on and its
+     * further heartbeats/commits are rejected with
+     * {@link RejectionReason#FENCED_MEMBER_EPOCH}. The joining instance
+     * inherits the member id's current assignment without a rebalance, since
+     * the membership set itself did not change.
      */
     public synchronized HeartbeatResponse join(String memberId) {
         MemberInfo existing = members.get(memberId);
+        long epoch = ++nextMemberEpoch;
         if (existing != null) {
-            existing.lastHeartbeatMs = clock.getAsLong();
+            members.put(memberId, new MemberInfo(epoch, clock.getAsLong()));
         } else {
-            members.put(memberId, new MemberInfo(clock.getAsLong()));
+            members.put(memberId, new MemberInfo(epoch, clock.getAsLong()));
             rebalance();
         }
-        return new HeartbeatResponse(generation, assignmentOf(memberId));
+        return new HeartbeatResponse(generation, epoch, assignmentOf(memberId), false);
     }
 
-    /** Renews the session; returns current generation and assignment. */
+    /**
+     * Legacy renew without an explicit member epoch: resolves to the member's
+     * current epoch. Prefer {@link #heartbeat(String, long, int)} so that
+     * replaced instances are fenced.
+     */
     public synchronized HeartbeatResponse heartbeat(String memberId, int generation)
             throws CoordinatorException {
         MemberInfo member = members.get(memberId);
@@ -125,13 +140,25 @@ public class GroupCoordinator implements AutoCloseable {
             throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
                     "member '" + memberId + "' is not registered");
         }
+        return heartbeat(memberId, member.epoch, generation);
+    }
+
+    /** Renews the session; returns current generation and assignment. */
+    public synchronized HeartbeatResponse heartbeat(String memberId, long memberEpoch, int generation)
+            throws CoordinatorException {
+        MemberInfo member = members.get(memberId);
+        if (member == null) {
+            throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
+                    "member '" + memberId + "' is not registered");
+        }
+        checkEpoch(memberId, member, memberEpoch);
         if (state == GroupState.REBALANCING) {
             throw new CoordinatorException(RejectionReason.REBALANCE_IN_PROGRESS,
                     "group is rebalancing");
         }
         checkGeneration(memberId, generation);
         member.lastHeartbeatMs = clock.getAsLong();
-        return new HeartbeatResponse(this.generation, assignmentOf(memberId));
+        return new HeartbeatResponse(this.generation, member.epoch, assignmentOf(memberId), false);
     }
 
     /** Voluntary leave; triggers a rebalance. */
@@ -143,7 +170,11 @@ public class GroupCoordinator implements AutoCloseable {
         rebalance();
     }
 
-    /** Commits an offset, fenced by generation and ownership. */
+    /**
+     * Legacy commit without an explicit member epoch: resolves to the member's
+     * current epoch. Prefer {@link #commit(String, long, int, Partition, long)}
+     * so that replaced instances are fenced.
+     */
     public synchronized void commit(String memberId, int generation, Partition partition, long offset)
             throws CoordinatorException {
         MemberInfo member = members.get(memberId);
@@ -151,6 +182,18 @@ public class GroupCoordinator implements AutoCloseable {
             throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
                     "member '" + memberId + "' is not registered");
         }
+        commit(memberId, member.epoch, generation, partition, offset);
+    }
+
+    /** Commits an offset, fenced by member epoch, generation and ownership. */
+    public synchronized void commit(String memberId, long memberEpoch, int generation,
+                                    Partition partition, long offset) throws CoordinatorException {
+        MemberInfo member = members.get(memberId);
+        if (member == null) {
+            throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
+                    "member '" + memberId + "' is not registered");
+        }
+        checkEpoch(memberId, member, memberEpoch);
         checkGeneration(memberId, generation);
         String owner = ownership.get(partition);
         if (!memberId.equals(owner)) {
@@ -185,6 +228,16 @@ public class GroupCoordinator implements AutoCloseable {
                 members.remove(id);
             }
             rebalance();
+        }
+    }
+
+    private void checkEpoch(String memberId, MemberInfo member, long memberEpoch)
+            throws CoordinatorException {
+        if (memberEpoch != member.epoch) {
+            throw new CoordinatorException(RejectionReason.FENCED_MEMBER_EPOCH,
+                    "member '" + memberId + "' used fenced instance epoch " + memberEpoch
+                            + ", current is " + member.epoch
+                            + ": a newer instance of this member id has taken over");
         }
     }
 
@@ -261,6 +314,12 @@ public class GroupCoordinator implements AutoCloseable {
     /** Registered member ids. */
     public synchronized Set<String> members() {
         return new LinkedHashSet<>(members.keySet());
+    }
+
+    /** Current fencing epoch of a registered member, or -1 if not registered. */
+    public synchronized long memberEpochOf(String memberId) {
+        MemberInfo member = members.get(memberId);
+        return member == null ? -1L : member.epoch;
     }
 
     /**

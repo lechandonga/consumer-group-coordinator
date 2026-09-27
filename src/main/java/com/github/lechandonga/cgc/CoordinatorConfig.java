@@ -13,11 +13,20 @@ public record CoordinatorConfig(
         long heartbeatIntervalMs,
         long sessionTimeoutMs,
         long rebalanceTimeoutMs,
-        Path offsetStorePath) {
+        Path offsetStorePath,
+        RebalanceMode rebalanceMode) {
+
+    /** Backward-compatible constructor: {@link RebalanceMode#IMMEDIATE}. */
+    public CoordinatorConfig(String topic, int partitionCount, long heartbeatIntervalMs,
+                             long sessionTimeoutMs, long rebalanceTimeoutMs, Path offsetStorePath) {
+        this(topic, partitionCount, heartbeatIntervalMs, sessionTimeoutMs, rebalanceTimeoutMs,
+                offsetStorePath, RebalanceMode.IMMEDIATE);
+    }
 
     public CoordinatorConfig {
         Objects.requireNonNull(topic, "topic");
         Objects.requireNonNull(offsetStorePath, "offsetStorePath");
+        Objects.requireNonNull(rebalanceMode, "rebalanceMode");
         if (topic.isBlank()) {
             throw new IllegalArgumentException("topic must not be blank");
         }
