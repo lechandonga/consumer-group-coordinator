@@ -26,7 +26,7 @@ import java.util.function.LongSupplier;
  *
  * <p>All public methods are thread-safe (serialized on the coordinator lock).
  */
-public class GroupCoordinator implements AutoCloseable {
+public class GroupCoordinator implements Coordinator, AutoCloseable {
 
     /** Ownership interval used to audit that no partition ever has two live owners. */
     private record OwnershipInterval(Partition partition, String owner, int generation,
