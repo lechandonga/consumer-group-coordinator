@@ -60,6 +60,11 @@ public class GroupCoordinator implements AutoCloseable {
     private int generation = 0;
     private long nextMemberEpoch = 0;
 
+    // BARRIER mode only: members that have not yet re-confirmed the open
+    // barrier, and the wall/clock deadline by which the barrier must settle.
+    private final Set<String> unconfirmed = new LinkedHashSet<>();
+    private long barrierDeadlineMs = Long.MAX_VALUE;
+
     /** Production constructor: uses the wall clock and runs background expiry checks. */
     public GroupCoordinator(CoordinatorConfig config) {
         this(config, System::currentTimeMillis, true);
@@ -119,11 +124,62 @@ public class GroupCoordinator implements AutoCloseable {
     public synchronized HeartbeatResponse join(String memberId) {
         MemberInfo existing = members.get(memberId);
         long epoch = ++nextMemberEpoch;
-        if (existing != null) {
-            members.put(memberId, new MemberInfo(epoch, clock.getAsLong()));
-        } else {
-            members.put(memberId, new MemberInfo(epoch, clock.getAsLong()));
+        members.put(memberId, new MemberInfo(epoch, clock.getAsLong()));
+        if (config.rebalanceMode() == RebalanceMode.BARRIER) {
+            if (existing == null) {
+                openBarrier(); // membership set changed
+            }
+            if (state == GroupState.REBALANCING) {
+                confirm(memberId);
+            }
+            return responseFor(memberId, epoch);
+        }
+        if (existing == null) {
             rebalance();
+        }
+        return new HeartbeatResponse(generation, epoch, assignmentOf(memberId), false);
+    }
+
+    /**
+     * Joins and then waits until any open rebalance barrier has settled
+     * (all members confirmed, or the {@code rebalanceTimeoutMs} deadline
+     * elapsed and the barrier was force-completed). The returned response is
+     * therefore always final: the caller either holds an assignment in a
+     * stable generation or the group became empty. The wait is bounded by the
+     * barrier deadline, so callers always get a definite conclusion.
+     */
+    public synchronized HeartbeatResponse joinAndAwait(String memberId)
+            throws CoordinatorException, InterruptedException {
+        HeartbeatResponse response = join(memberId);
+        while (response.rebalanceInProgress()) {
+            MemberInfo member = members.get(memberId);
+            if (member == null) {
+                throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
+                        "member '" + memberId + "' was evicted while waiting for the rebalance");
+            }
+            member.lastHeartbeatMs = clock.getAsLong(); // waiting here is a liveness signal
+            long remaining = barrierDeadlineMs - clock.getAsLong();
+            if (remaining <= 0) {
+                forceCompleteBarrier();
+            } else {
+                wait(Math.min(remaining, 50));
+            }
+            if (state != GroupState.REBALANCING) {
+                MemberInfo after = members.get(memberId);
+                if (after == null) {
+                    throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
+                            "member '" + memberId + "' was evicted while waiting for the rebalance");
+                }
+                response = new HeartbeatResponse(generation, after.epoch, assignmentOf(memberId), false);
+            }
+        }
+        return response;
+    }
+
+    /** Current response for a member, reflecting an open barrier if any. Caller must hold the lock. */
+    private HeartbeatResponse responseFor(String memberId, long epoch) {
+        if (state == GroupState.REBALANCING) {
+            return new HeartbeatResponse(generation, epoch, Set.of(), true);
         }
         return new HeartbeatResponse(generation, epoch, assignmentOf(memberId), false);
     }
@@ -153,6 +209,9 @@ public class GroupCoordinator implements AutoCloseable {
         }
         checkEpoch(memberId, member, memberEpoch);
         if (state == GroupState.REBALANCING) {
+            // A heartbeat during an open barrier still proves liveness, but
+            // the caller must re-join to confirm the barrier.
+            member.lastHeartbeatMs = clock.getAsLong();
             throw new CoordinatorException(RejectionReason.REBALANCE_IN_PROGRESS,
                     "group is rebalancing");
         }
@@ -166,6 +225,13 @@ public class GroupCoordinator implements AutoCloseable {
         if (members.remove(memberId) == null) {
             throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
                     "member '" + memberId + "' is not registered");
+        }
+        if (config.rebalanceMode() == RebalanceMode.BARRIER && state == GroupState.REBALANCING) {
+            unconfirmed.remove(memberId);
+            if (unconfirmed.isEmpty()) {
+                completeBarrier();
+            }
+            return;
         }
         rebalance();
     }
@@ -194,6 +260,10 @@ public class GroupCoordinator implements AutoCloseable {
                     "member '" + memberId + "' is not registered");
         }
         checkEpoch(memberId, member, memberEpoch);
+        if (state == GroupState.REBALANCING) {
+            throw new CoordinatorException(RejectionReason.REBALANCE_IN_PROGRESS,
+                    "group is rebalancing");
+        }
         checkGeneration(memberId, generation);
         String owner = ownership.get(partition);
         if (!memberId.equals(owner)) {
@@ -214,9 +284,16 @@ public class GroupCoordinator implements AutoCloseable {
         return store.committed(partition);
     }
 
-    /** Evicts members whose session expired; triggers a rebalance if any were evicted. */
+    /**
+     * Evicts members whose session expired and settles any rebalance barrier
+     * whose deadline has elapsed (deterministically evicting members that
+     * failed to confirm in time). Triggers a rebalance if membership changed.
+     */
     public synchronized void checkExpirations() {
         long now = clock.getAsLong();
+        if (state == GroupState.REBALANCING && now >= barrierDeadlineMs) {
+            forceCompleteBarrier();
+        }
         List<String> expired = new ArrayList<>();
         for (Map.Entry<String, MemberInfo> e : members.entrySet()) {
             if (now - e.getValue().lastHeartbeatMs > config.sessionTimeoutMs()) {
@@ -226,8 +303,15 @@ public class GroupCoordinator implements AutoCloseable {
         if (!expired.isEmpty()) {
             for (String id : expired) {
                 members.remove(id);
+                unconfirmed.remove(id);
             }
-            rebalance();
+            if (state == GroupState.REBALANCING) {
+                if (unconfirmed.isEmpty()) {
+                    completeBarrier();
+                }
+            } else {
+                rebalance();
+            }
         }
     }
 
@@ -254,8 +338,17 @@ public class GroupCoordinator implements AutoCloseable {
         }
     }
 
-    /** Establishes a new generation atomically. Caller must hold the lock. */
+    /** Establishes a new generation. Caller must hold the lock. */
     private void rebalance() {
+        if (config.rebalanceMode() == RebalanceMode.BARRIER) {
+            openBarrier();
+            return;
+        }
+        rebalanceImmediately();
+    }
+
+    /** IMMEDIATE mode: establishes a new generation atomically. Caller must hold the lock. */
+    private void rebalanceImmediately() {
         state = GroupState.REBALANCING;
         long now = clock.getAsLong();
         generation++;
@@ -281,6 +374,82 @@ public class GroupCoordinator implements AutoCloseable {
                     new OwnershipInterval(e.getKey(), e.getValue(), generation, now, -1L));
         }
         state = GroupState.STABLE;
+    }
+
+    /**
+     * BARRIER mode: fences the current generation and opens a confirmation
+     * barrier bounded by {@code rebalanceTimeoutMs}. No partition is owned
+     * while the barrier is open; the new assignment is established by
+     * {@link #completeBarrier()}. Caller must hold the lock.
+     */
+    private void openBarrier() {
+        long now = clock.getAsLong();
+        generation++;
+        closeOwnershipIntervals(now);
+        assignment = Map.of();
+        ownership = Map.of();
+        if (members.isEmpty()) {
+            unconfirmed.clear();
+            barrierDeadlineMs = Long.MAX_VALUE;
+            state = GroupState.EMPTY;
+            return;
+        }
+        unconfirmed.clear();
+        unconfirmed.addAll(members.keySet());
+        barrierDeadlineMs = now + config.rebalanceTimeoutMs();
+        state = GroupState.REBALANCING;
+        notifyAll();
+    }
+
+    /** Records a member's confirmation of the open barrier. Caller must hold the lock. */
+    private void confirm(String memberId) {
+        unconfirmed.remove(memberId);
+        if (unconfirmed.isEmpty()) {
+            completeBarrier();
+        }
+    }
+
+    /**
+     * Establishes the pending generation's assignment over the currently
+     * registered members and wakes any joinAndAwait waiters. Caller must hold the lock.
+     */
+    private void completeBarrier() {
+        long now = clock.getAsLong();
+        unconfirmed.clear();
+        barrierDeadlineMs = Long.MAX_VALUE;
+        if (members.isEmpty()) {
+            assignment = Map.of();
+            ownership = Map.of();
+            state = GroupState.EMPTY;
+            notifyAll();
+            return;
+        }
+        assignment = assignor.assign(new ArrayList<>(members.keySet()), partitions);
+        Map<Partition, String> newOwnership = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<Partition>> e : assignment.entrySet()) {
+            for (Partition p : e.getValue()) {
+                newOwnership.put(p, e.getKey());
+            }
+        }
+        ownership = Collections.unmodifiableMap(newOwnership);
+        for (Map.Entry<Partition, String> e : ownership.entrySet()) {
+            ownershipHistory.add(
+                    new OwnershipInterval(e.getKey(), e.getValue(), generation, now, -1L));
+        }
+        state = GroupState.STABLE;
+        notifyAll();
+    }
+
+    /**
+     * Deterministic conclusion of an overdue barrier: every member that did
+     * not confirm in time is evicted, and the barrier completes with the
+     * confirmed members only. Caller must hold the lock.
+     */
+    private void forceCompleteBarrier() {
+        for (String id : new ArrayList<>(unconfirmed)) {
+            members.remove(id);
+        }
+        completeBarrier();
     }
 
     private void closeOwnershipIntervals(long now) {
