@@ -223,6 +223,18 @@ class TcpProtocolIntegrationTest {
             assertCoverage(Set.of(b));
             assertEquals(4, b.assignment().size());
             assertTrue(coordinator.verifyNoOwnershipOverlap());
+
+            // a's old connection keeps trying after being evicted: it is fenced
+            // (not unknown, not stale), so it cannot re-occupy or commit.
+            Node aFinal = a;
+            JoinResult closedFinal = closed;
+            CoordinatorException oldHb = assertThrows(CoordinatorException.class,
+                    () -> ca.heartbeat("a", aFinal.token(), closedFinal.generation()));
+            assertEquals(RejectionReason.FENCED_INSTANCE, oldHb.reason());
+            CoordinatorException oldCommit = assertThrows(CoordinatorException.class,
+                    () -> ca.commit("a", aFinal.token(), closedFinal.generation(),
+                            new Partition("topic", 0), 123));
+            assertEquals(RejectionReason.FENCED_INSTANCE, oldCommit.reason());
         } finally {
             server.close();
         }

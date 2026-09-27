@@ -226,14 +226,19 @@ class RebalanceProtocolTest {
         JoinResult bJoin = c.joinGroup("b", null);
         c.joinGroup("a", a.instanceToken()); // stabilize b's generation
         JoinResult b = remember("b", c.syncGroup("b", bJoin.instanceToken(), bJoin.generation()));
-        // c opens a window; nobody participates in it.
+        // c opens a window; only c participates in it (its join counts).
         c.joinGroup("c", null);
         clock.advance(250); // beyond the bound
         // The next ordinary request lazily closes the timed-out window; a and
-        // b (non-participants) were evicted, so 'a' is unknown afterwards.
+        // b (non-participants) were evicted and their old tokens are fenced, so
+        // the stale a process is told FENCED_INSTANCE (not silently unknown).
         CoordinatorException e = assertThrows(CoordinatorException.class,
-                () -> c.heartbeat("a", "whatever", 1));
-        assertEquals(RejectionReason.UNKNOWN_MEMBER, e.reason());
+                () -> c.heartbeat("a", a.instanceToken(), 1));
+        assertEquals(RejectionReason.FENCED_INSTANCE, e.reason());
+        // A token that was never valid is still UNKNOWN_MEMBER, not fenced.
+        CoordinatorException bogus = assertThrows(CoordinatorException.class,
+                () -> c.heartbeat("a", "inst-never-existed", 1));
+        assertEquals(RejectionReason.UNKNOWN_MEMBER, bogus.reason());
         assertEquals(GroupState.STABLE, c.state());
         assertEquals(Set.of("c"), c.members());
         assertCompleteAndDisjoint(c, 4);

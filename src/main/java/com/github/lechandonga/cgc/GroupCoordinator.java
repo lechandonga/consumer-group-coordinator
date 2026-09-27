@@ -86,6 +86,16 @@ public class GroupCoordinator implements AutoCloseable {
     private final List<Partition> partitions;
 
     private final Map<String, MemberInfo> members = new LinkedHashMap<>();
+    /**
+     * Instance tokens that were once valid but are now permanently retired:
+     * superseded by a takeover ({@code member id -> newer instance}) or held by
+     * members evicted for never rejoining / session expiry. A request carrying
+     * one of these must be answered FENCED_INSTANCE rather than UNKNOWN_MEMBER,
+     * so an old process can tell "you have been replaced/dead" apart from "this
+     * id never joined".
+     */
+    private final java.util.Set<String> fencedTokens =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
     private Map<String, Set<Partition>> assignment = Map.of();
     private Map<Partition, String> ownership = Map.of();
     private final List<OwnershipInterval> ownershipHistory = new ArrayList<>();
@@ -215,9 +225,14 @@ public class GroupCoordinator implements AutoCloseable {
     public synchronized JoinResult joinGroup(String memberId, String token)
             throws CoordinatorException {
         maybeTimeoutPending();
+        boolean takeover = token == null || token.isBlank();
+        if (!takeover && fencedTokens.contains(token)) {
+            throw new CoordinatorException(RejectionReason.FENCED_INSTANCE,
+                    "instance of member '" + memberId + "' has been retired "
+                            + "(superseded by a newer instance or evicted after timeout)");
+        }
         long now = clock.getAsLong();
         MemberInfo existing = members.get(memberId);
-        boolean takeover = token == null || token.isBlank();
 
         if (existing == null) {
             String issued = newToken();
@@ -228,9 +243,13 @@ public class GroupCoordinator implements AutoCloseable {
         }
 
         if (takeover) {
-            // Same member id, new instance: issue a fresh identity and fence
-            // the old instance for good, even if it is still heartbeating.
+            // Same member id, new instance: retire the previous instance
+            // identity and issue a fresh one. The old instance is fenced from
+            // this instant on, even if it keeps heartbeating in another process.
             String issued = newToken();
+            if (existing.instanceToken != null) {
+                fencedTokens.add(existing.instanceToken);
+            }
             existing.instanceToken = issued;
             existing.lastHeartbeatMs = now;
             if (pending != null) {
@@ -282,8 +301,19 @@ public class GroupCoordinator implements AutoCloseable {
      */
     public synchronized JoinResult syncGroup(String memberId, String token, int gen)
             throws CoordinatorException {
-        maybeTimeoutPending();
-        MemberInfo member = requireMember(memberId);
+        if (token != null && !token.isBlank() && fencedTokens.contains(token)) {
+            throw new CoordinatorException(RejectionReason.FENCED_INSTANCE,
+                    "instance of member '" + memberId + "' has been retired "
+                            + "(superseded by a newer instance or evicted after timeout)");
+        }
+        MemberInfo member = members.get(memberId);
+        if (member == null) {
+            // The member may have been evicted by a timeout that fired before
+            // this request acquired the lock; that close is now observable.
+            maybeTimeoutPending();
+            throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
+                    "member '" + memberId + "' is not registered");
+        }
         checkInstance(member, memberId, token);
         if (state == GroupState.REBALANCING) {
             if (gen != pending.generation) {
@@ -295,6 +325,8 @@ public class GroupCoordinator implements AutoCloseable {
                 throw new CoordinatorException(RejectionReason.ILLEGAL_GENERATION,
                         "member '" + memberId + "' synced unknown generation " + gen);
             }
+            // Register participation *before* any timeout-driven close so a
+            // member syncing exactly at the bound is counted as having rejoined.
             member.lastHeartbeatMs = clock.getAsLong();
             pending.rejoined.add(memberId);
             tryCompletePending(false);
@@ -303,6 +335,7 @@ public class GroupCoordinator implements AutoCloseable {
             }
             return stableResult(memberId, token);
         }
+        maybeTimeoutPending();
         checkGeneration(memberId, gen);
         return stableResult(memberId, token);
     }
@@ -310,9 +343,11 @@ public class GroupCoordinator implements AutoCloseable {
     /** Instance-fenced heartbeat. */
     public synchronized HeartbeatResponse heartbeat(String memberId, String token, int gen)
             throws CoordinatorException {
+        // Identity first: a retired instance is fenced no matter what state or
+        // generation it claims; only a live current instance reaches the
+        // rebalancing/generation checks below.
+        MemberInfo member = authorize(memberId, token);
         maybeTimeoutPending();
-        MemberInfo member = requireMember(memberId);
-        checkInstance(member, memberId, token);
         if (state == GroupState.REBALANCING) {
             throw new CoordinatorException(RejectionReason.REBALANCE_IN_PROGRESS,
                     "group is rebalancing (generation " + pending.generation + " open)");
@@ -331,12 +366,7 @@ public class GroupCoordinator implements AutoCloseable {
 
     /** Instance-fenced leave. */
     public synchronized void leave(String memberId, String token) throws CoordinatorException {
-        MemberInfo member = members.get(memberId);
-        if (member == null) {
-            throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
-                    "member '" + memberId + "' is not registered");
-        }
-        checkInstance(member, memberId, token);
+        authorize(memberId, token);
         leaveInternal(memberId);
     }
 
@@ -363,11 +393,10 @@ public class GroupCoordinator implements AutoCloseable {
 
     private void commitInternal(String memberId, String token, int gen, Partition partition,
                                 long offset, boolean embedded) throws CoordinatorException {
+        // Identity fencing takes precedence over state/generation/ownership so
+        // a retired instance always sees FENCED_INSTANCE.
+        MemberInfo member = embedded ? requireMember(memberId) : authorize(memberId, token);
         maybeTimeoutPending();
-        MemberInfo member = requireMember(memberId);
-        if (!embedded) {
-            checkInstance(member, memberId, token);
-        }
         if (state == GroupState.REBALANCING) {
             throw new CoordinatorException(RejectionReason.REBALANCE_IN_PROGRESS,
                     "group is rebalancing; commit must be retried in the new generation");
@@ -405,8 +434,16 @@ public class GroupCoordinator implements AutoCloseable {
         if (expired.isEmpty()) {
             return;
         }
+        if (expired.isEmpty()) {
+            return;
+        }
+        // Session expiry is an abnormal disappearance: retire the instance
+        // identity so a stale process that wakes up later stays fenced.
         for (String id : expired) {
-            members.remove(id);
+            MemberInfo gone = members.remove(id);
+            if (gone != null && gone.instanceToken != null) {
+                fencedTokens.add(gone.instanceToken);
+            }
         }
         if (pending != null) {
             pending.expected.removeAll(expired);
@@ -423,6 +460,29 @@ public class GroupCoordinator implements AutoCloseable {
             throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
                     "member '" + memberId + "' is not registered");
         }
+        return member;
+    }
+
+    /**
+     * Authorizes a multi-process request: the member exists and the presented
+     * token is its current instance identity. A token that used to be valid but
+     * has since been retired (takeover / eviction) yields FENCED_INSTANCE even
+     * though the member id may no longer be present, so an old process cannot
+     * mistake "replaced" for "never joined" and keeps being rejected.
+     */
+    private MemberInfo authorize(String memberId, String token) throws CoordinatorException {
+        maybeTimeoutPending();
+        if (token != null && !token.isBlank() && fencedTokens.contains(token)) {
+            throw new CoordinatorException(RejectionReason.FENCED_INSTANCE,
+                    "instance of member '" + memberId + "' has been retired "
+                            + "(superseded by a newer instance or evicted after timeout)");
+        }
+        MemberInfo member = members.get(memberId);
+        if (member == null) {
+            throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
+                    "member '" + memberId + "' is not registered");
+        }
+        checkInstance(member, memberId, token);
         return member;
     }
 
@@ -496,8 +556,24 @@ public class GroupCoordinator implements AutoCloseable {
     private void finalizePending(boolean byTimeout, long now) {
         PendingRebalance p = pending;
         cancelPendingTimeout();
-        // Members that never rejoined are removed from the group.
+        // Snapshot the identities of members that never rejoined, remove them,
+        // and retire their tokens so lingering old processes keep receiving
+        // FENCED_INSTANCE instead of silently re-entering.
+        List<MemberInfo> evicted = new ArrayList<>();
+        for (String id : p.expected) {
+            if (!p.rejoined.contains(id)) {
+                MemberInfo info = members.get(id);
+                if (info != null) {
+                    evicted.add(info);
+                }
+            }
+        }
         members.keySet().removeIf(id -> p.expected.contains(id) && !p.rejoined.contains(id));
+        for (MemberInfo info : evicted) {
+            if (info.instanceToken != null) {
+                fencedTokens.add(info.instanceToken);
+            }
+        }
         pending = null;
         lastCompletedByTimeout = byTimeout;
         installAssignment(now);
