@@ -106,7 +106,7 @@ java -cp target/classes com.github.lechandonga.cgc.process.CoordinatorServerMain
 ```bash
 java -cp target/classes com.github.lechandonga.cgc.process.ConsumerProcessMain \
   127.0.0.1 <port> <memberId> [instanceToken|-] \
-  [--duration-ms N] [--poll-ms N] [--slow-join] [--observe-rebalance]
+  [--duration-ms N] [--poll-ms N] [--slow-join] [--observe-rebalance] [--join-delay-ms N]
 ```
 
 - 不带 token（或 `-`）即以**全新实例**身份加入该 member id；进程启动后会打印
@@ -117,6 +117,8 @@ java -cp target/classes com.github.lechandonga.cgc.process.ConsumerProcessMain \
 - `--slow-join`：只完成两阶段入组的第 1 阶段即空转（用于演示/测试再均衡上界）。
 - `--observe-rebalance`：再均衡进行中只观察/续约、不发起第 1 阶段，使窗口只能
   到设定上界才收场（用于确定性地观察超时）。
+- `--join-delay-ms`：第 1、2 阶段之间故意停顿 N 毫秒，让并发加入的成员来得及
+  取代本成员的窗口（用于确定性地复现“变化交错”，见下节）。
 
 一个最小的手工验证（两个消费者进程共享 4 个分区）：
 
@@ -149,6 +151,43 @@ java -cp target/classes com.github.lechandonga.cgc.process.ConsumerProcessMain 1
 `rebalanceTimeoutMs` 取不同值会带来确定的行为差异：参数改小，窗口更早收场；
 改大，调用方能在更长时间内持续观察到 `IN_PROGRESS`。单测
 `timeoutValueChangesBehavior` 用注入时钟对同一场景取两个上界值直接断言这一点。
+
+### 成员同时加入与变化交错
+
+多个成员几乎同时启动、或一个成员的变化撞上另一个成员的变化时，每一次新
+变化都会**取代**此前尚未关闭的窗口（代数前进、旧窗口作废）。此时处在较早
+那一轮变化里的成员，随后用来确认并领取归属的第 2 阶段请求，携带的正是它
+自己第 1 阶段被告知等待的代数。协调器把这种情况识别为**“成员变化还在进行
+中”**，而不是最终失败：
+
+- 该成员确认的是“自己被告知等待、但已被取代”的代数（即它当前所知的最新
+  代数）时，`SYNC` 返回 `IN_PROGRESS` 并指向当前仍在开放的窗口——调用方
+  跟随该代数继续重试即可，不会崩溃；这次请求同时计为一次**存活续约**，
+  因此持续确认的成员不会在窗口到点上界时被误剔除；
+- 确认一个**自己从未参与过**的代数，仍是最终失败 `STALE_GENERATION`
+  （“落后但合法”与“混乱请求”据此区分）；声称未来代数仍是
+  `ILLEGAL_GENERATION`；
+- 被顶替/已失效的旧实例**永远**先得到 `FENCED_INSTANCE`（身份检查先于一切
+  状态/代数判断），无法顺着“进行中”的路径重新拿到分区或推进位点；同一
+  id 的新实例走正常接管流程干净接手。
+
+消费者进程端对称地处理交错：`IN_PROGRESS` 响应里携带的代数可能比自己刚问
+的更新，消费者**跟随协调器指向的代数**继续第 2 阶段；遇到可重试的拒绝
+（`STALE/ILLEGAL_GENERATION`、`REBALANCE_IN_PROGRESS`）时重新发第 1 阶段而
+不是退出；只有 `FENCED_INSTANCE` 才让进程停止（退出码 3）。因此无论变化怎么
+交错，活着且正常参与的成员最终都能拿到本轮归属并继续提交，到
+`rebalanceTimeoutMs` 上界必有确定结论。
+
+本地复现（真实多进程、无需外部服务）：测试
+`MultiProcessTest.simultaneousStartupAndInterleavedJoinsConvergeWithoutProcessFailures`
+先让三个消费者进程背靠背同时启动，再让成员 d 用 `--join-delay-ms 3000`
+（第 1、2 阶段之间故意停顿）制造确定性交错——d 的窗口开放期间成员 e 加入并
+取代 d 的代数，d 的首次确认必然落在已被取代的窗口上。断言：d 观察到的是
+`REBALANCING`（进行中）而不是异常退出，最终五个进程的归属完整覆盖、互不重
+叠、在同一代数上持续提交，且任何进程输出中都没有异常或 `FENCED`。配套单测
+（注入时钟、完全确定）：`syncForSupersededWindowIsInProgressNotFinalFailure`、
+`activelySyncingMemberSurvivesTimeoutCloseOfSupersededWindow`、
+`fencedInstanceCannotRideInProgressSync`。
 
 ### 实例身份与“换了实例”的可判定
 
@@ -183,16 +222,16 @@ java -cp target/classes com.github.lechandonga.cgc.process.ConsumerProcessMain 1
 mvn test
 ```
 
-测试覆盖（46 个用例）：
+测试覆盖（50 个用例）：
 
 | 测试类 | 覆盖场景 |
 | --- | --- |
 | `CoordinatorConfigTest` | 各类非法配置被明确拒绝；再均衡上界可独立于会话超时调小 |
 | `OffsetCommitStoreTest` | 提交持久化、重启恢复、撕裂尾部截断、CRC 损坏丢弃、位点倒退拒绝 |
 | `GroupCoordinatorTest` | 加入/退出/过期触发再均衡、分配完整且不重叠、各类代数栅栏拒绝、归属区间审计 |
-| `RebalanceProtocolTest` | 两阶段入组、`IN_PROGRESS` 与最终失败可区分、上界到期确定性收场（含超时标志）、参数取不同值行为不同、被顶替/超时剔除的旧实例 `FENCED_INSTANCE`、新实例干净接管（注入时钟，完全确定） |
+| `RebalanceProtocolTest` | 两阶段入组、`IN_PROGRESS` 与最终失败可区分、上界到期确定性收场（含超时标志）、参数取不同值行为不同、被顶替/超时剔除的旧实例 `FENCED_INSTANCE`、新实例干净接管；变化交错时确认被取代窗口得到 `IN_PROGRESS` 而非最终失败、持续确认的成员挺过超时收场、旧实例无法顺着“进行中”回场（注入时钟，完全确定） |
 | `server.TcpProtocolIntegrationTest` | 同 JVM 内真实 loopback TCP：多连接共享分区、归属不重叠、越权提交拒绝、接管、旧连接被 fence、超时关闭 |
-| `process.MultiProcessTest` | **独立 OS 进程**：多进程加入/提交/完整覆盖；某进程被 kill 后幸存者接走其分区并继续；新实例接管、旧进程持续心跳/提交被 `FENCED_INSTANCE` 拒绝并以码 3 退出；慢成员拖到上界、观察者先见 `REBALANCING` 后见 `TIMEOUT-CLOSED` |
+| `process.MultiProcessTest` | **独立 OS 进程**：多进程加入/提交/完整覆盖；某进程被 kill 后幸存者接走其分区并继续；新实例接管、旧进程持续心跳/提交被 `FENCED_INSTANCE` 拒绝并以码 3 退出；慢成员拖到上界、观察者先见 `REBALANCING` 后见 `TIMEOUT-CLOSED`；多进程同时启动与跨成员变化交错时无人异常退出、最终归属完整不重叠且全员继续提交 |
 | `CrashRecoveryTest` | 成员崩溃→会话过期→同 id 重启后从已确认位点恢复；幸存成员持续接管全部分区 |
 | `ConcurrencyTest` | 并发提交 × 再均衡 × 崩溃重启风暴（固定随机种子可复现）：位点单调、归属无重叠、无丢失更新 |
 
@@ -201,6 +240,8 @@ mvn test
 1. 再均衡后各成员分区集合完整覆盖全部分区且互不重叠，跨进程亦然；
 2. `verifyNoOwnershipOverlap()` 恒为真——任何时刻不存在两个有效归属；
 3. 成员变化进行中只能观察到 `IN_PROGRESS`（可重试），收场有确定结论与上界；
+   确认被交错取代的窗口同样是 `IN_PROGRESS`，只有确认从未参与的代数才是
+   最终失败；
 4. 被顶替/失效的旧实例在任意代数、任意状态下都得到 `FENCED_INSTANCE`，无法
    占用分区或推进位点；新实例可干净接管；
 5. 已确认位点单调不减，任何成员的本地进度不超过已确认位点；

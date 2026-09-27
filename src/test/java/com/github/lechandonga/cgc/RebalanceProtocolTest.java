@@ -337,6 +337,87 @@ class RebalanceProtocolTest {
     }
 
     @Test
+    void syncForSupersededWindowIsInProgressNotFinalFailure() throws Exception {
+        GroupCoordinator c = newCoordinator(4, 500);
+        // a joins: window gen1 opens and a is told to wait for it.
+        JoinResult aJoin = c.joinGroup("a", null);
+        assertEquals(JoinStatus.IN_PROGRESS, aJoin.status());
+        // b joins before a finishes phase 2: a's window is superseded by gen2.
+        JoinResult bJoin = c.joinGroup("b", null);
+        assertEquals(aJoin.generation() + 1, bJoin.generation());
+
+        // a confirms the generation it was itself told to wait for: this is a
+        // change still in progress — retryable IN_PROGRESS pointing at the
+        // live window, NOT a final STALE_GENERATION failure.
+        JoinResult aSync = c.syncGroup("a", aJoin.instanceToken(), aJoin.generation());
+        assertEquals(JoinStatus.IN_PROGRESS, aSync.status());
+        assertEquals(bJoin.generation(), aSync.generation());
+
+        // a follows the pointer and finishes phase 2 of the live window; the
+        // window closes once b has synced too, and the assignment is complete
+        // and disjoint.
+        JoinResult bWaiting = c.syncGroup("b", bJoin.instanceToken(), bJoin.generation());
+        assertEquals(JoinStatus.IN_PROGRESS, bWaiting.status(),
+                "window still waits for a's phase 2");
+        JoinResult a2 = c.syncGroup("a", aJoin.instanceToken(), aSync.generation());
+        JoinResult b2 = c.syncGroup("b", bJoin.instanceToken(), bJoin.generation());
+        assertEquals(JoinStatus.STABLE, a2.status());
+        assertEquals(JoinStatus.STABLE, b2.status());
+        assertEquals(2, a2.assignment().size());
+        assertEquals(2, b2.assignment().size());
+        assertCompleteAndDisjoint(c, 4);
+        assertTrue(c.verifyNoOwnershipOverlap());
+        c.close();
+    }
+
+    @Test
+    void activelySyncingMemberSurvivesTimeoutCloseOfSupersededWindow() throws Exception {
+        GroupCoordinator c = newCoordinator(4, 300);
+        JoinResult aJoin = c.joinGroup("a", null);          // gen1 window
+        JoinResult bJoin = c.joinGroup("b", null);          // gen2 supersedes
+        // a keeps confirming its (superseded) generation: in-progress, and the
+        // attempt proves liveness so the bound close must not evict it.
+        clock.advance(150);
+        JoinResult s1 = c.syncGroup("a", aJoin.instanceToken(), aJoin.generation());
+        assertEquals(JoinStatus.IN_PROGRESS, s1.status());
+        assertEquals(bJoin.generation(), s1.generation());
+        // Past the bound: b never synced nor renewed, so b is evicted; a was
+        // actively participating and survives with a deterministic conclusion.
+        clock.advance(200);
+        JoinResult s2 = c.syncGroup("a", aJoin.instanceToken(), s1.generation());
+        assertEquals(JoinStatus.STABLE, s2.status());
+        assertTrue(s2.completedByTimeout());
+        assertEquals(Set.of("a"), c.members());
+        assertEquals(4, s2.assignment().size());
+        assertCompleteAndDisjoint(c, 4);
+        c.close();
+    }
+
+    @Test
+    void fencedInstanceCannotRideInProgressSync() throws Exception {
+        GroupCoordinator c = newCoordinator(2, 500);
+        JoinResult oldJoin = c.joinGroup("a", null);        // gen1 window
+        // A new instance of the same id takes over mid-window: gen2 opens and
+        // the old instance token is retired from this instant on.
+        JoinResult neoJoin = c.joinGroup("a", null);
+        assertNotEquals(oldJoin.instanceToken(), neoJoin.instanceToken());
+        // The old instance tries to confirm its old generation through the
+        // in-progress path: fenced permanently, never IN_PROGRESS.
+        CoordinatorException e = assertThrows(CoordinatorException.class,
+                () -> c.syncGroup("a", oldJoin.instanceToken(), oldJoin.generation()));
+        assertEquals(RejectionReason.FENCED_INSTANCE, e.reason());
+        CoordinatorException again = assertThrows(CoordinatorException.class,
+                () -> c.syncGroup("a", oldJoin.instanceToken(), neoJoin.generation()));
+        assertEquals(RejectionReason.FENCED_INSTANCE, again.reason());
+        // The new instance cleanly closes its own window and owns everything.
+        JoinResult neo = c.syncGroup("a", neoJoin.instanceToken(), neoJoin.generation());
+        assertEquals(JoinStatus.STABLE, neo.status());
+        assertEquals(2, neo.assignment().size());
+        assertCompleteAndDisjoint(c, 2);
+        c.close();
+    }
+
+    @Test
     void expiredMemberIsEvictedMidWindowAndWindowCloses() throws Exception {
         GroupCoordinator c = newCoordinator(4, 300, 800);
         JoinResult a = remember("a", bootstrap("a"));

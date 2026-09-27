@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <pre>
  *   java ... ConsumerProcessMain &lt;host&gt; &lt;port&gt; &lt;memberId&gt; [&lt;instanceToken&gt;|-]
- *        [--duration-ms N] [--slow-join] [--topic T] [--poll-ms N]
+ *        [--duration-ms N] [--slow-join] [--join-delay-ms N] [--topic T] [--poll-ms N]
  * </pre>
  *
  * <p>Output (one event per line, flushed): {@code TOKEN ..}, {@code JOINED ..},
@@ -34,7 +34,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code TIMEOUT-CLOSED}, {@code REJECTED HEARTBEAT/COMMIT &lt;REASON&gt;},
  * {@code FENCED}. {@code --slow-join} performs phase 1 only and then idles,
  * letting the rebalance time bound elapse (used to exercise deterministic
- * timeout close end-to-end).
+ * timeout close end-to-end). {@code --join-delay-ms} idles between phase 1 and
+ * phase 2, so a concurrently started member can supersede this member's window
+ * before its first sync (used to reproduce interleaved membership changes).
+ *
+ * <p>While a membership change is in flight the consumer treats IN_PROGRESS
+ * (and the matching retryable rejections) as "keep waiting/retrying", never as
+ * a final failure: it follows the generation the coordinator points at, so
+ * interleaved joins cannot crash the process. Only FENCED_INSTANCE (this
+ * instance was superseded or evicted) stops it, with exit code 3.
  */
 public final class ConsumerProcessMain {
 
@@ -48,6 +56,7 @@ public final class ConsumerProcessMain {
         long durationMs = Long.MAX_VALUE;
         boolean slowJoin = false;
         boolean observeRebalance = false;
+        long joinDelayMs = 0;
         String topic = "topic";
         long pollMs = 100;
 
@@ -56,6 +65,7 @@ public final class ConsumerProcessMain {
                 case "--duration-ms" -> durationMs = Long.parseLong(args[++i]);
                 case "--slow-join" -> slowJoin = true;
                 case "--observe-rebalance" -> observeRebalance = true;
+                case "--join-delay-ms" -> joinDelayMs = Long.parseLong(args[++i]);
                 case "--topic" -> topic = args[++i];
                 case "--poll-ms" -> pollMs = Long.parseLong(args[++i]);
                 default -> { /* ignore unknown flags for forward compatibility */ }
@@ -63,18 +73,27 @@ public final class ConsumerProcessMain {
         }
 
         int exitCode = run(host, port, memberId, providedToken, durationMs,
-                slowJoin, observeRebalance, topic, pollMs);
+                slowJoin, observeRebalance, joinDelayMs, topic, pollMs);
         System.out.flush();
         System.exit(exitCode);
     }
 
     private static int run(String host, int port, String memberId, String providedToken,
                            long durationMs, boolean slowJoin, boolean observeRebalance,
-                           String topic, long pollMs)
+                           long joinDelayMs, String topic, long pollMs)
             throws Exception {
         try (CoordinatorClient client = new CoordinatorClient(host, port, topic)) {
-            Session session = joinAndSync(client, memberId, providedToken, slowJoin);
+            AtomicBoolean fenced = new AtomicBoolean(false);
+            Session session = joinAndSync(client, memberId, providedToken, slowJoin,
+                    joinDelayMs, fenced);
             if (session == null) {
+                if (fenced.get()) {
+                    // Fenced before we ever established ourselves: stop with
+                    // the dedicated exit code, do not retry as a new instance.
+                    System.out.println("FENCED\t" + memberId);
+                    System.out.flush();
+                    return 3;
+                }
                 return 1; // rejection already logged
             }
             session.observeRebalance = observeRebalance;
@@ -85,7 +104,6 @@ public final class ConsumerProcessMain {
                 return 0;
             }
 
-            AtomicBoolean fenced = new AtomicBoolean(false);
             // Dedicated connection for heartbeats: a slow commit on the poll
             // connection must never head-of-line-block session renewal.
             final CoordinatorClient hbClient = new CoordinatorClient(host, port, topic);
@@ -134,13 +152,18 @@ public final class ConsumerProcessMain {
 
     /** Phase 1 + phase 2 with bounded retries while the window is IN_PROGRESS. */
     private static Session joinAndSync(CoordinatorClient client, String memberId,
-                                       String providedToken, boolean slowJoin) throws Exception {
+                                       String providedToken, boolean slowJoin,
+                                       long joinDelayMs, AtomicBoolean fenced)
+            throws Exception {
         JoinResult joined;
         try {
             joined = client.joinGroup(memberId, providedToken);
         } catch (CoordinatorException e) {
             System.out.println("REJECTED\tJOIN\t" + e.reason().name());
             System.out.flush();
+            if (e.reason() == RejectionReason.FENCED_INSTANCE) {
+                fenced.set(true);
+            }
             return null;
         }
         System.out.println("TOKEN\t" + joined.instanceToken());
@@ -155,15 +178,61 @@ public final class ConsumerProcessMain {
             System.out.flush();
             return session;
         }
+        if (joinDelayMs > 0) {
+            // Deliberately idle between phase 1 and phase 2 so a concurrently
+            // starting member can supersede this member's window before the
+            // first sync (reproduces interleaved membership changes).
+            Thread.sleep(joinDelayMs);
+        }
 
+        // Phase 2. A membership change can supersede the window we are waiting
+        // for at any moment; the coordinator then answers IN_PROGRESS pointing
+        // at the live window. That is retryable, never a crash: follow the
+        // generation forward until one window closes for us.
         JoinResult synced = joined;
+        int gen = joined.generation();
         long guard = 0;
         while (synced.status() == JoinStatus.IN_PROGRESS) {
             guard++;
-            System.out.println("REBALANCING\t" + memberId + "\t" + joined.generation());
+            System.out.println("REBALANCING\t" + memberId + "\t" + gen);
             System.out.flush();
             Thread.sleep(20);
-            synced = client.syncGroup(memberId, session.token, joined.generation());
+            try {
+                synced = client.syncGroup(memberId, session.token, gen);
+            } catch (CoordinatorException e) {
+                System.out.println("REJECTED\tSYNC\t" + e.reason().name());
+                System.out.flush();
+                switch (e.reason()) {
+                    case FENCED_INSTANCE -> {
+                        // Superseded or evicted while joining: stop, do not
+                        // sneak back in as yet another instance.
+                        fenced.set(true);
+                        return null;
+                    }
+                    case UNKNOWN_MEMBER -> {
+                        // Evicted before we ever established ourselves; we are
+                        // alive, so re-enter cleanly as a fresh instance.
+                        joined = client.joinGroup(memberId, null);
+                        session.token = joined.instanceToken();
+                        synced = joined;
+                    }
+                    default -> {
+                        // STALE/ILLEGAL_GENERATION or REBALANCE_IN_PROGRESS:
+                        // the group moved while we waited. Re-issue phase 1
+                        // with our current token, which attaches us to the
+                        // live window (or opens one if the group is stable and
+                        // we are behind).
+                        joined = client.joinGroup(memberId, session.token);
+                        session.token = joined.instanceToken();
+                        synced = joined;
+                    }
+                }
+            }
+            if (synced.status() == JoinStatus.IN_PROGRESS) {
+                // Adopt the generation the coordinator points at; it may be
+                // newer than the one we just asked about.
+                gen = synced.generation();
+            }
             if (guard > 100_000) {
                 throw new IllegalStateException("sync loop did not terminate");
             }
@@ -390,21 +459,51 @@ public final class ConsumerProcessMain {
      * Full phase-1 + phase-2 rejoin. Caller holds {@code session.groupLock}.
      * When {@code asNewInstance} is true the member rejoins with a blank token
      * (fresh identity); otherwise it presents its current instance token.
+     *
+     * <p>While this rejoin waits, yet another membership change may supersede
+     * the window it is syncing for. IN_PROGRESS responses carry the live
+     * generation and are followed forward; retryable rejections re-issue
+     * phase 1 instead of failing the process. Only FENCED_INSTANCE propagates.
      */
     private static void rejoinLocked(CoordinatorClient client, String memberId, Session session,
                                      boolean asNewInstance)
             throws Exception {
+        boolean asNew = asNewInstance;
         JoinResult joined = client.joinGroup(memberId,
-                asNewInstance ? null : session.token);
+                asNew ? null : session.token);
         session.token = joined.instanceToken();
         JoinResult synced = joined;
+        int gen = joined.generation();
         long guard = 0;
         while (synced.status() == JoinStatus.IN_PROGRESS) {
             if (guard++ > 100_000) {
                 throw new IllegalStateException("rejoin sync loop did not terminate");
             }
             Thread.sleep(10);
-            synced = client.syncGroup(memberId, session.token, joined.generation());
+            try {
+                synced = client.syncGroup(memberId, session.token, gen);
+            } catch (CoordinatorException ce) {
+                switch (ce.reason()) {
+                    case FENCED_INSTANCE -> throw ce; // caller stops this instance
+                    case UNKNOWN_MEMBER -> {
+                        // Evicted mid-rejoin: re-enter as a fresh instance.
+                        asNew = true;
+                        joined = client.joinGroup(memberId, null);
+                        session.token = joined.instanceToken();
+                        synced = joined;
+                    }
+                    default -> {
+                        // The window moved again while we waited: re-issue
+                        // phase 1 for the live generation and keep waiting.
+                        joined = client.joinGroup(memberId, asNew ? null : session.token);
+                        session.token = joined.instanceToken();
+                        synced = joined;
+                    }
+                }
+            }
+            if (synced.status() == JoinStatus.IN_PROGRESS) {
+                gen = synced.generation();
+            }
         }
         session.token = synced.instanceToken();
         applyAssignment(session, synced, client);

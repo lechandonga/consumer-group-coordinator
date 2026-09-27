@@ -38,6 +38,18 @@ import java.util.function.LongSupplier;
  *       {@code completedByTimeout}.</li>
  * </ul>
  *
+ * <p><b>Interleaved changes.</b> When several members join (nearly) at once,
+ * each new change supersedes the previously open window. A member whose
+ * phase-2 confirms the <em>superseded</em> generation it was itself told to
+ * wait for (its {@code knownGeneration}) is answered
+ * {@link JoinStatus#IN_PROGRESS} pointing at the live window — a retryable
+ * in-progress outcome, never a final failure — and the attempt doubles as a
+ * liveness proof so the time-bound close will not evict an actively syncing
+ * member. Syncing a generation the member was never part of remains a final
+ * {@link RejectionReason#STALE_GENERATION} failure, and a retired instance
+ * token is always {@link RejectionReason#FENCED_INSTANCE} regardless of any
+ * open window.
+ *
  * <p><b>Instance identity.</b> Every member registered through the multi-process
  * protocol receives an opaque instance token. All heartbeats/commits must carry
  * the current token; when the same member id restarts as a new (blank-token)
@@ -334,6 +346,25 @@ public class GroupCoordinator implements AutoCloseable {
         if (state == GroupState.REBALANCING) {
             if (gen != pending.generation) {
                 if (gen < pending.generation) {
+                    if (gen == member.knownGeneration) {
+                        // The member is confirming the very generation its own
+                        // phase-1 told it to wait for, but a newer membership
+                        // change superseded that window before phase 2 arrived.
+                        // That is "change still in progress", not a final
+                        // failure: prove liveness (so a timeout close keeps
+                        // this actively-syncing member) and point the caller at
+                        // the live window so it can retry with the current
+                        // generation. A fenced instance never reaches this
+                        // path — identity is checked above — so a superseded or
+                        // evicted old instance cannot ride IN_PROGRESS back in.
+                        member.lastHeartbeatMs = clock.getAsLong();
+                        if (pending.expected.contains(memberId)) {
+                            pending.renewed.add(memberId);
+                        }
+                        return JoinResult.inProgress(pending.generation, token);
+                    }
+                    // Syncing a generation this member was never part of is a
+                    // genuinely confused, final failure.
                     throw new CoordinatorException(RejectionReason.STALE_GENERATION,
                             "member '" + memberId + "' synced stale generation " + gen
                                     + ", current rebalance generation is " + pending.generation);

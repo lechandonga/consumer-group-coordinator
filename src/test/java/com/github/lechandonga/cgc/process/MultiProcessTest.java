@@ -177,6 +177,53 @@ class MultiProcessTest {
         return gen;
     }
 
+    /**
+     * Polls until every given member holds a complementary slice of exactly
+     * {@code partitionCount} partitions in total (complete, non-overlapping)
+     * and all of them have committed at one common generation.
+     */
+    private static void waitForStableCoverage(long timeoutMs, List<Proc> consumers,
+                                              int partitionCount) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            java.util.Set<String> union = new java.util.HashSet<>();
+            int total = 0;
+            Integer commonGen = null;
+            boolean allCommitted = true;
+            for (Proc p : consumers) {
+                String id = p.name.substring("consumer-".length());
+                List<String> mine = assignedPartitions(p.lines, id);
+                union.addAll(mine);
+                total += mine.size();
+                Integer g = latestCommitGeneration(p.lines, id);
+                if (g == null) {
+                    allCommitted = false;
+                } else if (commonGen == null) {
+                    commonGen = g;
+                } else if (!commonGen.equals(g)) {
+                    allCommitted = false;
+                }
+            }
+            if (allCommitted && union.size() == partitionCount && total == partitionCount) {
+                return;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted waiting for stable coverage");
+            }
+        }
+        StringBuilder state = new StringBuilder();
+        for (Proc p : consumers) {
+            String id = p.name.substring("consumer-".length());
+            state.append(' ').append(id).append('=').append(assignedPartitions(p.lines, id))
+                    .append("(gen ").append(latestCommitGeneration(p.lines, id)).append(')');
+        }
+        throw new AssertionError("members never converged on a complete, disjoint,"
+                + " commonly-committed assignment:" + state);
+    }
+
     @Test
     void independentProcessesJoinSharePartitionsCommitAndCoverAll() throws Exception {
         try (Proc server = startServer(4, 100, 60_000, 5_000)) {
@@ -331,9 +378,73 @@ class MultiProcessTest {
         }
     }
 
+    /**
+     * Several consumer processes start (nearly) at once, and one member's join
+     * interleaves with another's: members whose phase-2 lands in a superseded
+     * window must observe a retryable in-progress outcome — never a final
+     * failure, never a crash — and everyone must still converge on a complete,
+     * non-overlapping assignment they all keep committing to.
+     */
     @Test
-    void slowMemberRebalanceClosesAtBoundAndFastMemberIsToldTimeout() throws Exception {
-        // Tight bound so the deterministic close is quick to observe.
+    void simultaneousStartupAndInterleavedJoinsConvergeWithoutProcessFailures()
+            throws Exception {
+        // Generous rebalance bound: windows stay open long enough for the
+        // interleavings to actually happen, even on a loaded machine. Five
+        // partitions so that all five members end up owning (and committing
+        // on) exactly one each.
+        try (Proc server = startServer(5, 100, 60_000, 10_000)) {
+            int port = server.port();
+            // Phase 1: three consumers started back-to-back ("simultaneously").
+            // Their phase-1 joins race; whichever window a member was waiting
+            // for may be superseded before its first sync arrives.
+            Proc a = startConsumer(port, "a", null, "--duration-ms", "60000");
+            Proc b = startConsumer(port, "b", null, "--duration-ms", "60000");
+            Proc c = startConsumer(port, "c", null, "--duration-ms", "60000");
+            try (a; b; c) {
+                waitForStableCoverage(40_000, List.of(a, b, c), 5);
+
+                // Phase 2: deterministic interleaving. d joins but deliberately
+                // idles between phase 1 and phase 2; while d's window is open,
+                // e's join supersedes d's generation. d's first sync therefore
+                // confirms a window that no longer exists — the exact situation
+                // that used to be answered with a final failure and crash the
+                // process.
+                Proc d = startConsumer(port, "d", null, "--duration-ms", "45000",
+                        "--join-delay-ms", "3000");
+                try (d) {
+                    d.token(); // d's window is open now; d idles before phase 2
+                    Proc e = startConsumer(port, "e", null, "--duration-ms", "40000");
+                    try (e) {
+                        e.token(); // supersedes d's window before d's first sync
+
+                        // d observes the superseded window as IN_PROGRESS
+                        // (retryable), distinguishable from a final failure...
+                        waitForLinePoll(d.lines, l -> l.startsWith("REBALANCING\td\t"),
+                                20_000, "d observes in-progress for the superseded window");
+                        // ...and everyone still converges: complete, disjoint
+                        // coverage, all committing at one common generation.
+                        waitForStableCoverage(40_000, List.of(a, b, c, d, e), 5);
+
+                        // No process crashed or was fenced because of the
+                        // interleaving, and no exception ever reached stdout.
+                        for (Proc p : List.of(a, b, c, d, e)) {
+                            assertTrue(p.process.isAlive(),
+                                    p.name + " exited unexpectedly during interleaved joins");
+                            assertTrue(p.lines.stream().noneMatch(
+                                            l -> l.contains("Exception") || l.contains("FENCED")),
+                                    p.name + " emitted failure output: " + p.lines.stream()
+                                            .filter(l -> l.contains("Exception")
+                                                    || l.contains("FENCED"))
+                                            .toList());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void slowMemberRebalanceClosesAtBoundAndFastMemberIsToldTimeout() throws Exception {        // Tight bound so the deterministic close is quick to observe.
         try (Proc server = startServer(4, 100, 60_000, 700)) {
             int port = server.port();
             // Fast member joins and works. In observe mode it keeps heartbeating
