@@ -162,7 +162,7 @@ public class GroupCoordinator implements Coordinator, AutoCloseable {
             if (remaining <= 0) {
                 forceCompleteBarrier();
             } else {
-                wait(Math.min(remaining, 50));
+                wait(Math.min(remaining, Math.max(10, config.heartbeatIntervalMs())));
             }
             if (state != GroupState.REBALANCING) {
                 MemberInfo after = members.get(memberId);
