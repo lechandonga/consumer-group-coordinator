@@ -64,11 +64,11 @@ class MultiProcessTest {
 
         @Override
         public void close() {
-            process.destroy();
+            // Tests need deterministic teardown, not graceful shutdown: kill the
+            // OS process hard and wait for it so no child lingers between tests.
+            process.destroyForcibly();
             try {
-                if (!process.waitFor(5, TimeUnit.SECONDS)) {
-                    process.destroyForcibly();
-                }
+                process.waitFor(5, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 process.destroyForcibly();
