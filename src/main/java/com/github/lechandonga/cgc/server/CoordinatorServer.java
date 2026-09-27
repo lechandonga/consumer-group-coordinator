@@ -168,6 +168,10 @@ public final class CoordinatorServer implements Closeable {
                 requireFields(f, 4);
                 yield joinResult(f[1], coordinator.syncGroup(f[1], f[2], parseInt(f[3], "generation")));
             }
+            case "SYNCNOW" -> {
+                requireFields(f, 3);
+                yield joinResult(f[1], coordinator.syncCurrent(f[1], f[2]));
+            }
             case "HEARTBEAT" -> {
                 requireFields(f, 4);
                 HeartbeatResponse r = coordinator.heartbeat(f[1], f[2], parseInt(f[3], "generation"));

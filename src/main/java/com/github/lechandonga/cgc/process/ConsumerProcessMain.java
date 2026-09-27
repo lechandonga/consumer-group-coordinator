@@ -47,6 +47,7 @@ public final class ConsumerProcessMain {
         String providedToken = args.length > 3 && !"-".equals(args[3]) ? args[3] : null;
         long durationMs = Long.MAX_VALUE;
         boolean slowJoin = false;
+        boolean observeRebalance = false;
         String topic = "topic";
         long pollMs = 100;
 
@@ -54,6 +55,7 @@ public final class ConsumerProcessMain {
             switch (args[i]) {
                 case "--duration-ms" -> durationMs = Long.parseLong(args[++i]);
                 case "--slow-join" -> slowJoin = true;
+                case "--observe-rebalance" -> observeRebalance = true;
                 case "--topic" -> topic = args[++i];
                 case "--poll-ms" -> pollMs = Long.parseLong(args[++i]);
                 default -> { /* ignore unknown flags for forward compatibility */ }
@@ -61,19 +63,21 @@ public final class ConsumerProcessMain {
         }
 
         int exitCode = run(host, port, memberId, providedToken, durationMs,
-                slowJoin, topic, pollMs);
+                slowJoin, observeRebalance, topic, pollMs);
         System.out.flush();
         System.exit(exitCode);
     }
 
     private static int run(String host, int port, String memberId, String providedToken,
-                           long durationMs, boolean slowJoin, String topic, long pollMs)
+                           long durationMs, boolean slowJoin, boolean observeRebalance,
+                           String topic, long pollMs)
             throws Exception {
         try (CoordinatorClient client = new CoordinatorClient(host, port, topic)) {
             Session session = joinAndSync(client, memberId, providedToken, slowJoin);
             if (session == null) {
                 return 1; // rejection already logged
             }
+            session.observeRebalance = observeRebalance;
             if (slowJoin) {
                 // Phase 1 done; deliberately never sync. Idle until duration
                 // elapses so the coordinator's rebalance bound can fire.
@@ -82,22 +86,28 @@ public final class ConsumerProcessMain {
             }
 
             AtomicBoolean fenced = new AtomicBoolean(false);
+            // Dedicated connection for heartbeats: a slow commit on the poll
+            // connection must never head-of-line-block session renewal.
+            final CoordinatorClient hbClient = new CoordinatorClient(host, port, topic);
             Thread heartbeater = new Thread(() ->
-                    heartbeatLoop(client, memberId, topic, session, fenced),
+                    heartbeatLoop(hbClient, memberId, session, fenced),
                     "heartbeat-" + memberId);
             heartbeater.setDaemon(true);
             heartbeater.start();
 
             long deadline = System.currentTimeMillis() + durationMs;
-            while (System.currentTimeMillis() < deadline && !fenced.get()) {
-                if (!consumeOnce(client, memberId, topic, session, fenced)) {
-                    break; // fenced
+            try {
+                while (System.currentTimeMillis() < deadline && !fenced.get()) {
+                    if (!consumeOnce(client, memberId, session, fenced)) {
+                        break; // fenced
+                    }
+                    Thread.sleep(pollMs);
                 }
-                Thread.sleep(pollMs);
+            } finally {
+                heartbeater.interrupt();
+                heartbeater.join(2000);
+                hbClient.close();
             }
-
-            heartbeater.interrupt();
-            heartbeater.join(2000);
             if (fenced.get()) {
                 System.out.println("FENCED\t" + memberId);
                 System.out.flush();
@@ -109,10 +119,17 @@ public final class ConsumerProcessMain {
     }
 
     private static final class Session {
+        final Object groupLock = new Object();
         volatile String token;
         volatile int generation;
         volatile Set<Partition> assignment = Set.of();
         final Map<Integer, Long> positions = new LinkedHashMap<>();
+        /** Generation for which a rejoin is already in flight, so two threads
+         *  (heartbeat + poll) do not each issue phase 1 for the same change. */
+        int rejoinInProgressFor = Integer.MIN_VALUE;
+        /** When true, REBALANCE_IN_PROGRESS is only observed/waited for; the
+         *  member never issues phase 1 (used to exercise the timeout bound). */
+        boolean observeRebalance;
     }
 
     /** Phase 1 + phase 2 with bounded retries while the window is IN_PROGRESS. */
@@ -179,7 +196,7 @@ public final class ConsumerProcessMain {
         }
     }
 
-    private static void heartbeatLoop(CoordinatorClient client, String memberId, String topic,
+    private static void heartbeatLoop(CoordinatorClient hbClient, String memberId,
                                       Session session, AtomicBoolean fenced) {
         while (!Thread.currentThread().isInterrupted() && !fenced.get()) {
             try {
@@ -188,61 +205,83 @@ public final class ConsumerProcessMain {
                 Thread.currentThread().interrupt();
                 return;
             }
-            try {
-                HeartbeatResponse r = client.heartbeat(memberId, session.token, session.generation);
-                if (!r.assignment().equals(session.assignment)) {
-                    session.assignment = r.assignment();
-                    System.out.println("ASSIGNED\t" + memberId + "\t" + format(r.assignment()));
-                    System.out.flush();
-                }
-            } catch (CoordinatorException e) {
-                if (handleCoordinatorFailure(e, "HEARTBEAT", client, memberId, topic,
-                        session, fenced)) {
+            // Serialize group-state transitions against the poll loop, but
+            // requests themselves run on this independent connection.
+            synchronized (session.groupLock) {
+                if (fenced.get()) {
                     return;
                 }
-            } catch (Exception e) {
-                return;
+                try {
+                    HeartbeatResponse r = hbClient.heartbeat(memberId, session.token,
+                            session.generation);
+                    if (!r.assignment().equals(session.assignment)) {
+                        session.assignment = r.assignment();
+                        System.out.println("ASSIGNED\t" + memberId + "\t"
+                                + format(r.assignment()));
+                        System.out.flush();
+                    }
+                } catch (CoordinatorException e) {
+                    if (handleCoordinatorFailure(e, "HEARTBEAT", hbClient, memberId,
+                            session, fenced, false)) {
+                        return;
+                    }
+                } catch (Exception e) {
+                    return;
+                }
             }
         }
     }
 
     /** Consumes one record per owned partition and commits the new position. */
-    private static boolean consumeOnce(CoordinatorClient client, String memberId, String topic,
+    private static boolean consumeOnce(CoordinatorClient client, String memberId,
                                        Session session, AtomicBoolean fenced) {
-        Set<Partition> owned = session.assignment;
+        Set<Partition> owned;
+        synchronized (session.groupLock) {
+            owned = session.assignment;
+        }
         for (Partition p : owned) {
             long next;
             synchronized (session.positions) {
                 next = session.positions.getOrDefault(p.id(), -1L) + 1;
             }
-            try {
-                client.commit(memberId, session.token, session.generation, p, next);
-                synchronized (session.positions) {
-                    session.positions.put(p.id(), next);
-                }
-                System.out.println("COMMITTED\t" + memberId + "\tp" + p.id() + "\t" + next
-                        + "\tgen" + session.generation);
-                System.out.flush();
-            } catch (CoordinatorException e) {
-                if (handleCoordinatorFailure(e, "COMMIT", client, memberId, topic,
-                        session, fenced)) {
+            synchronized (session.groupLock) {
+                if (fenced.get()) {
                     return false;
                 }
-            } catch (Exception e) {
-                return false;
+                try {
+                    client.commit(memberId, session.token, session.generation, p, next);
+                    synchronized (session.positions) {
+                        session.positions.put(p.id(), next);
+                    }
+                    System.out.println("COMMITTED\t" + memberId + "\tp" + p.id() + "\t" + next
+                            + "\tgen" + session.generation);
+                    System.out.flush();
+                } catch (CoordinatorException e) {
+                    if (handleCoordinatorFailure(e, "COMMIT", client, memberId,
+                            session, fenced, !session.observeRebalance)) {
+                        return false;
+                    }
+                } catch (Exception e) {
+                    return false;
+                }
             }
         }
         return true;
     }
 
     /**
+     * Handles a rejection. Must be called while holding {@code session.groupLock}.
+     *
+     * @param mayRejoin whether a full phase-1 rejoin is allowed (commits yes; a
+     *                  heartbeat merely follows an in-flight window and must not
+     *                  open a new one, which would churn the generation)
      * @return true if this instance must stop (fenced / unrecoverable),
-     *         false if it has rejoined and may continue
+     *         false if it has caught up and may continue
      */
     private static boolean handleCoordinatorFailure(CoordinatorException e, String op,
                                                     CoordinatorClient client, String memberId,
-                                                    String topic, Session session,
-                                                    AtomicBoolean fenced) {
+                                                    Session session, AtomicBoolean fenced,
+                                                    boolean mayRejoin) {
         RejectionReason reason = e.reason();
         System.out.println("REJECTED\t" + op + "\t" + reason.name());
         System.out.flush();
@@ -250,12 +289,28 @@ public final class ConsumerProcessMain {
             fenced.set(true);
             return true;
         }
-        if (reason == RejectionReason.REBALANCE_IN_PROGRESS
-                || reason == RejectionReason.STALE_GENERATION
-                || reason == RejectionReason.ILLEGAL_GENERATION
-                || reason == RejectionReason.UNKNOWN_MEMBER) {
+        if (reason == RejectionReason.REBALANCE_IN_PROGRESS) {
+            if (session.observeRebalance) {
+                // Deliberately do not issue phase 1: just keep observing the
+                // in-progress window until it closes at its time bound. Because
+                // this member keeps heartbeating, the server retains it across
+                // the timeout close and reports TIMEOUT-CLOSED.
+                try {
+                    followCurrentLocked(client, memberId, session);
+                } catch (CoordinatorException ce) {
+                    if (ce.reason() == RejectionReason.FENCED_INSTANCE) {
+                        fenced.set(true);
+                        return true;
+                    }
+                } catch (Exception ignored) {
+                    // retry next tick
+                }
+                return false;
+            }
+            // Normal member: participates in the open generation (phase 1 with
+            // the current token never opens a new window) and waits to close.
             try {
-                rejoin(client, memberId, session);
+                rejoinLocked(client, memberId, session, false);
             } catch (CoordinatorException ce) {
                 if (ce.reason() == RejectionReason.FENCED_INSTANCE) {
                     fenced.set(true);
@@ -263,9 +318,48 @@ public final class ConsumerProcessMain {
                     System.out.flush();
                     return true;
                 }
-                // Other transient rejoin failures: next loop tick retries.
             } catch (Exception ignored) {
-                // transport issue: loop ends via deadline/process tear-down
+                // transport: retry next tick
+            }
+            return false;
+        }
+        if (reason == RejectionReason.STALE_GENERATION
+                || reason == RejectionReason.ILLEGAL_GENERATION
+                || reason == RejectionReason.UNKNOWN_MEMBER) {
+            // The group moved on without us (or we were evicted). Only the
+            // poll loop issues phase 1, so the heartbeat and the poll loop can
+            // never open competing windows for the same membership change.
+            if (mayRejoin) {
+                try {
+                    // UNKNOWN (evicted, not superseded): re-enter as a new
+                    // instance; STALE: rejoin carrying the current token.
+                    boolean asNew = reason == RejectionReason.UNKNOWN_MEMBER;
+                    rejoinLocked(client, memberId, session, asNew);
+                } catch (CoordinatorException ce) {
+                    if (ce.reason() == RejectionReason.FENCED_INSTANCE) {
+                        fenced.set(true);
+                        System.out.println("REJECTED\tREJOIN\tFENCED_INSTANCE");
+                        System.out.flush();
+                        return true;
+                    }
+                } catch (Exception ignored) {
+                    // transport: retry next tick
+                }
+            } else {
+                // Heartbeat path: the change has already closed and we are
+                // behind/evicted. The group lock serializes this against the
+                // poll loop, so it is safe to perform the single rejoin here.
+                try {
+                    boolean asNew = reason == RejectionReason.UNKNOWN_MEMBER;
+                    rejoinLocked(client, memberId, session, asNew);
+                } catch (CoordinatorException ce) {
+                    if (ce.reason() == RejectionReason.FENCED_INSTANCE) {
+                        fenced.set(true);
+                        return true;
+                    }
+                } catch (Exception ignored) {
+                    // retry next heartbeat
+                }
             }
             return false;
         }
@@ -273,9 +367,36 @@ public final class ConsumerProcessMain {
         return false;
     }
 
-    private static void rejoin(CoordinatorClient client, String memberId, Session session)
+    /** Waits for and adopts the currently open generation without a new join. */
+    private static void followCurrentLocked(CoordinatorClient client, String memberId,
+                                            Session session) throws Exception {
+        JoinResult synced = client.syncCurrent(memberId, session.token);
+        long guard = 0;
+        while (synced.status() == JoinStatus.IN_PROGRESS) {
+            if (guard++ > 100_000) {
+                throw new IllegalStateException("follow-current loop did not terminate");
+            }
+            Thread.sleep(10);
+            synced = client.syncCurrent(memberId, session.token);
+        }
+        session.token = synced.instanceToken();
+        applyAssignment(session, synced, client);
+        System.out.println("ASSIGNED\t" + memberId + "\t" + format(synced.assignment())
+                + (synced.completedByTimeout() ? "\tTIMEOUT-CLOSED" : ""));
+        System.out.flush();
+    }
+
+    /**
+     * Full phase-1 + phase-2 rejoin. Caller holds {@code session.groupLock}.
+     * When {@code asNewInstance} is true the member rejoins with a blank token
+     * (fresh identity); otherwise it presents its current instance token.
+     */
+    private static void rejoinLocked(CoordinatorClient client, String memberId, Session session,
+                                     boolean asNewInstance)
             throws Exception {
-        JoinResult joined = client.joinGroup(memberId, session.token);
+        JoinResult joined = client.joinGroup(memberId,
+                asNewInstance ? null : session.token);
+        session.token = joined.instanceToken();
         JoinResult synced = joined;
         long guard = 0;
         while (synced.status() == JoinStatus.IN_PROGRESS) {

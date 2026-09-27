@@ -96,16 +96,21 @@ class TcpProtocolIntegrationTest {
              CoordinatorClient cb = new CoordinatorClient("127.0.0.1", server.port())) {
             ca.ping();
             Node a = connectAndJoin(ca, "a", null);
-            // Bring b in; a must participate in the new generation over the wire.
+            // Bring b in; both members must finish phase 2 over the wire.
             JoinResult bJoin = cb.joinGroup("b", null);
             assertEquals(JoinStatus.IN_PROGRESS, bJoin.status());
-            JoinResult aRejoin = ca.joinGroup("a", a.token());
-            // a's phase-1 closes the window (both members now participating).
-            JoinResult aSynced = aRejoin.status() == JoinStatus.STABLE
-                    ? aRejoin
-                    : ca.syncGroup("a", a.token(), bJoin.generation());
+            ca.joinGroup("a", a.token()); // a phase 1 (window stays open)
+            JoinResult bWaiting = cb.syncGroup("b", bJoin.instanceToken(), bJoin.generation());
+            assertEquals(JoinStatus.IN_PROGRESS, bWaiting.status(),
+                    "b alone cannot close the window before a finishes phase 2");
+            // a finishes phase 2 -> window closes; b then syncs and gets stable.
+            JoinResult aSynced = ca.syncGroup("a", a.token(), bJoin.generation());
+            assertEquals(JoinStatus.STABLE, aSynced.status());
+            JoinResult bSynced = cb.syncGroup("b", bJoin.instanceToken(), bJoin.generation());
+            assertEquals(JoinStatus.STABLE, bSynced.status());
             Node aStable = new Node(ca, a.token(), aSynced.generation(), aSynced.assignment());
-            Node b = connectAndJoinSync(cb, "b", bJoin);
+            Node b = new Node(cb, bSynced.instanceToken(), bSynced.generation(),
+                    bSynced.assignment());
             assertCoverage(Set.of(aStable, b));
             assertEquals(2, aStable.assignment().size());
             assertEquals(2, b.assignment().size());

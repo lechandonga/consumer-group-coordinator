@@ -58,6 +58,8 @@ public class GroupCoordinator implements AutoCloseable {
         long lastHeartbeatMs;
         /** Current instance token; null means registered through the legacy embedded API. */
         String instanceToken;
+        /** Generation this instance has last synced to / is considered part of. */
+        int knownGeneration = -1;
 
         MemberInfo(long now, String instanceToken) {
             this.lastHeartbeatMs = now;
@@ -70,7 +72,12 @@ public class GroupCoordinator implements AutoCloseable {
         final int generation;
         final long deadlineMs;
         final Set<String> expected;
+        /** Members that issued phase 1 for this generation. */
         final Set<String> rejoined = new LinkedHashSet<>();
+        /** Members that completed phase 2 (sync) for this generation. */
+        final Set<String> synced = new LinkedHashSet<>();
+        /** Existing members that kept heartbeating while the window was open. */
+        final Set<String> renewed = new LinkedHashSet<>();
 
         PendingRebalance(int generation, long deadlineMs, Set<String> expected) {
             this.generation = generation;
@@ -236,9 +243,11 @@ public class GroupCoordinator implements AutoCloseable {
 
         if (existing == null) {
             String issued = newToken();
-            members.put(memberId, new MemberInfo(now, issued));
+            MemberInfo added = new MemberInfo(now, issued);
+            members.put(memberId, added);
             openPending(now);
             pending.rejoined.add(memberId);
+            added.knownGeneration = pending.generation;
             return JoinResult.inProgress(pending.generation, issued);
         }
 
@@ -255,6 +264,7 @@ public class GroupCoordinator implements AutoCloseable {
             if (pending != null) {
                 // The new instance satisfies this member's outstanding rejoin.
                 pending.rejoined.add(memberId);
+                existing.knownGeneration = pending.generation;
                 tryCompletePending(false);
             } else {
                 // Membership identity changed even though the id is the same:
@@ -262,6 +272,7 @@ public class GroupCoordinator implements AutoCloseable {
                 // the generation level as well as the token level.
                 openPending(now);
                 pending.rejoined.add(memberId);
+                existing.knownGeneration = pending.generation;
             }
             if (state == GroupState.REBALANCING) {
                 return JoinResult.inProgress(pending.generation, issued);
@@ -269,17 +280,11 @@ public class GroupCoordinator implements AutoCloseable {
             return stableResult(memberId, issued);
         }
 
-        // Existing member presenting its token: rejoin for the open window or
-        // an idempotent re-sync when the group is already stable.
+        // Existing member presenting its token: rejoin for the open window.
         checkInstance(existing, memberId, token);
         existing.lastHeartbeatMs = now;
         if (pending != null) {
-            if (token.equals(existing.instanceToken)) {
-                pending.rejoined.add(memberId);
-            }
-            if (pending.generation != generation) {
-                throw new IllegalStateException("pending generation drift");
-            }
+            pending.rejoined.add(memberId);
             tryCompletePending(false);
             if (state == GroupState.REBALANCING) {
                 return JoinResult.inProgress(pending.generation, token);
@@ -290,6 +295,17 @@ public class GroupCoordinator implements AutoCloseable {
             throw new CoordinatorException(RejectionReason.UNKNOWN_MEMBER,
                     "member '" + memberId + "' has no established generation");
         }
+        if (existing.knownGeneration < generation) {
+            // The group is stable but this member is on an older generation
+            // (it missed the window that just closed). Its phase-1 cannot be
+            // retroactively applied; open a fresh window so everyone converges
+            // on one common, newer generation.
+            openPending(now);
+            pending.rejoined.add(memberId);
+            existing.knownGeneration = pending.generation;
+            return JoinResult.inProgress(pending.generation, token);
+        }
+        // Already current: idempotent re-sync, no new membership change.
         return stableResult(memberId, token);
     }
 
@@ -329,6 +345,7 @@ public class GroupCoordinator implements AutoCloseable {
             // member syncing exactly at the bound is counted as having rejoined.
             member.lastHeartbeatMs = clock.getAsLong();
             pending.rejoined.add(memberId);
+            pending.synced.add(memberId);
             tryCompletePending(false);
             if (state == GroupState.REBALANCING) {
                 return JoinResult.inProgress(pending.generation, token);
@@ -337,6 +354,39 @@ public class GroupCoordinator implements AutoCloseable {
         }
         maybeTimeoutPending();
         checkGeneration(memberId, gen);
+        return stableResult(memberId, token);
+    }
+
+    /**
+     * Attaches an existing, current instance to the generation that is open
+     * <em>right now</em>, without starting a new membership change. Used by
+     * members that discover via heartbeat/commit that a rebalance is underway
+     * (REBALANCE_IN_PROGRESS) or that their generation just went stale: they
+     * participate in the already-open window and wait for it to close. If the
+     * group is stable, the current assignment is returned. A member not part of
+     * the open generation (evicted/never registered) is rejected accordingly.
+     */
+    /**
+     * Observes / waits for the generation that is open <em>right now</em>
+     * without starting a new change and <b>without</b> counting the caller as a
+     * participant: an existing member signals participation only through an
+     * explicit {@link #joinGroup(String, String)} for the open generation. This
+     * is what a heartbeat uses to notice an in-progress rebalance (observable
+     * IN_PROGRESS, distinct from failure) and wait for it to close; if the
+     * caller has in fact been evicted it is fenced here.
+     */
+    public synchronized JoinResult syncCurrent(String memberId, String token)
+            throws CoordinatorException {
+        MemberInfo member = authorize(memberId, token);
+        if (state == GroupState.REBALANCING) {
+            // Observing the open window also proves liveness, but does not
+            // count as phase-1 participation.
+            if (pending.expected.contains(memberId)) {
+                member.lastHeartbeatMs = clock.getAsLong();
+                pending.renewed.add(memberId);
+            }
+            return JoinResult.inProgress(pending.generation, token);
+        }
         return stableResult(memberId, token);
     }
 
@@ -349,6 +399,13 @@ public class GroupCoordinator implements AutoCloseable {
         MemberInfo member = authorize(memberId, token);
         maybeTimeoutPending();
         if (state == GroupState.REBALANCING) {
+            // An existing member that keeps heartbeating during the window is
+            // alive: record the renewal (so a timeout close does not evict it)
+            // but it still observes IN_PROGRESS until the generation closes.
+            if (pending.expected.contains(memberId)) {
+                member.lastHeartbeatMs = clock.getAsLong();
+                pending.renewed.add(memberId);
+            }
             throw new CoordinatorException(RejectionReason.REBALANCE_IN_PROGRESS,
                     "group is rebalancing (generation " + pending.generation + " open)");
         }
@@ -533,14 +590,14 @@ public class GroupCoordinator implements AutoCloseable {
         schedulePendingTimeout(config.rebalanceTimeoutMs());
     }
 
-    /** Closes the window early if every expected member has rejoined. */
+    /** Closes the window early once every expected member has finished phase 2. */
     private void tryCompletePending(boolean byTimeout) {
         if (pending == null) {
             return;
         }
         long now = clock.getAsLong();
         boolean timedOut = now >= pending.deadlineMs;
-        if (!byTimeout && !timedOut && !pending.rejoined.containsAll(pending.expected)) {
+        if (!byTimeout && !timedOut && !pending.synced.containsAll(pending.expected)) {
             return;
         }
         finalizePending(timedOut, now);
@@ -556,19 +613,26 @@ public class GroupCoordinator implements AutoCloseable {
     private void finalizePending(boolean byTimeout, long now) {
         PendingRebalance p = pending;
         cancelPendingTimeout();
-        // Snapshot the identities of members that never rejoined, remove them,
-        // and retire their tokens so lingering old processes keep receiving
-        // FENCED_INSTANCE instead of silently re-entering.
+        // Who survives the close:
+        //   * any member that completed phase 2 (synced), or
+        //   * on a timeout close, an existing member that kept heartbeating
+        //     (alive but did not need to finish the protocol).
+        // A member that only issued phase 1 and then went silent (never
+        // synced, never renewed) is evicted, and its instance identity retired
+        // so its lingering process keeps receiving FENCED_INSTANCE.
+        boolean retainRenewed = byTimeout;
+        java.util.function.Predicate<String> survives = id ->
+                p.synced.contains(id) || (retainRenewed && p.renewed.contains(id));
         List<MemberInfo> evicted = new ArrayList<>();
         for (String id : p.expected) {
-            if (!p.rejoined.contains(id)) {
+            if (!survives.test(id)) {
                 MemberInfo info = members.get(id);
                 if (info != null) {
                     evicted.add(info);
                 }
             }
         }
-        members.keySet().removeIf(id -> p.expected.contains(id) && !p.rejoined.contains(id));
+        members.keySet().removeIf(id -> p.expected.contains(id) && !survives.test(id));
         for (MemberInfo info : evicted) {
             if (info.instanceToken != null) {
                 fencedTokens.add(info.instanceToken);
@@ -576,6 +640,10 @@ public class GroupCoordinator implements AutoCloseable {
         }
         pending = null;
         lastCompletedByTimeout = byTimeout;
+        // Every surviving member is now part of the freshly closed generation.
+        for (MemberInfo survivor : members.values()) {
+            survivor.knownGeneration = generation;
+        }
         installAssignment(now);
     }
 
@@ -606,6 +674,10 @@ public class GroupCoordinator implements AutoCloseable {
     }
 
     private JoinResult stableResult(String memberId, String token) {
+        MemberInfo m = members.get(memberId);
+        if (m != null) {
+            m.knownGeneration = generation;
+        }
         return new JoinResult(JoinStatus.STABLE, generation, token, assignmentOf(memberId),
                 lastCompletedByTimeout);
     }
@@ -686,10 +758,10 @@ public class GroupCoordinator implements AutoCloseable {
         return pending == null ? -1L : pending.deadlineMs;
     }
 
-    /** Ids the open window is still waiting for, or empty when no window is open. */
+    /** Ids that have not finished phase 2 of the open window yet (empty if none open). */
     public synchronized Set<String> pendingAwaiting() {
         return pending == null ? Set.of() : new LinkedHashSet<>(
-                pending.expected.stream().filter(id -> !pending.rejoined.contains(id)).toList());
+                pending.expected.stream().filter(id -> !pending.synced.contains(id)).toList());
     }
 
     /** Whether the last closed generation was closed by the rebalance time bound. */

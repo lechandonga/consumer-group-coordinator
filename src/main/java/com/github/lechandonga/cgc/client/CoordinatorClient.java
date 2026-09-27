@@ -65,6 +65,17 @@ public final class CoordinatorClient implements Closeable {
         return parseJoin(request("SYNC\t" + memberId + "\t" + instanceToken + "\t" + generation));
     }
 
+    /**
+     * Participates in / waits for the currently open generation without starting
+     * a new membership change. Used after REBALANCE_IN_PROGRESS / STALE findings
+     * from heartbeat or commit, so a member follows an in-flight rebalance
+     * instead of opening yet another window.
+     */
+    public JoinResult syncCurrent(String memberId, String instanceToken)
+            throws IOException, CoordinatorException {
+        return parseJoin(request("SYNCNOW\t" + memberId + "\t" + instanceToken));
+    }
+
     public HeartbeatResponse heartbeat(String memberId, String instanceToken, int generation)
             throws IOException, CoordinatorException {
         String line = request(

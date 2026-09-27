@@ -29,7 +29,7 @@ import org.junit.jupiter.api.io.TempDir;
  * {@code COMMITTED}, {@code REJECTED ..}, {@code TIMEOUT-CLOSED}, {@code FENCED})
  * and the {@code BOUND <port>} line of {@link CoordinatorServerMain}.
  */
-class MultiProcessIT {
+class MultiProcessTest {
 
     @TempDir
     Path dir;
@@ -139,8 +139,7 @@ class MultiProcessIT {
         return new Proc("consumer-" + memberId, new ProcessBuilder(cmd));
     }
 
-    private static List<String> assignedPartitions(List<String> lines, String memberId) {
-        // Last ASSIGNED line for the member wins.
+    private static List<String> assignedPartitions(List<String> lines, String memberId) {        // Last ASSIGNED line for the member wins.
         String last = null;
         for (String l : lines) {
             if (l.startsWith("ASSIGNED\t" + memberId + "\t")) {
@@ -161,40 +160,79 @@ class MultiProcessIT {
         return out;
     }
 
+    /** Generation carried by the member's most recent accepted commit, or null. */
+    private static Integer latestCommitGeneration(List<String> lines, String memberId) {
+        Integer gen = null;
+        for (String l : lines) {
+            String prefix = "COMMITTED\t" + memberId + "\t";
+            if (l.startsWith(prefix) && l.contains("\tgen")) {
+                String tail = l.substring(l.lastIndexOf("gen") + 3);
+                try {
+                    gen = Integer.parseInt(tail.trim());
+                } catch (NumberFormatException ignored) {
+                    // keep previous
+                }
+            }
+        }
+        return gen;
+    }
+
     @Test
     void independentProcessesJoinSharePartitionsCommitAndCoverAll() throws Exception {
         try (Proc server = startServer(4, 100, 60_000, 5_000)) {
             int port = server.port();
-            try (Proc a = startConsumer(port, "a", null, "--duration-ms", "8000");
-                 Proc b = startConsumer(port, "b", null, "--duration-ms", "8000")) {
-                a.token();
-                b.token();
-
-                // Both eventually settle with non-empty assignments.
+            // Bring the first consumer up and wait until it stably owns the
+            // whole group, then add the second process. This mirrors a real
+            // rollout and avoids two phase-1s racing the bootstrap generation.
+            Proc a = startConsumer(port, "a", null, "--duration-ms", "30000");
+            try (a) {
                 waitForLinePoll(a.lines,
-                        l -> assignedPartitions(a.lines, "a").size() == 2,
-                        15_000, "a assignment of 2");
-                waitForLinePoll(b.lines,
-                        l -> assignedPartitions(b.lines, "b").size() == 2,
-                        15_000, "b assignment of 2");
+                        l -> assignedPartitions(a.lines, "a").size() == 4
+                                && latestCommitGeneration(a.lines, "a") != null,
+                        15_000, "a owns all 4 before b joins");
+                try (Proc b = startConsumer(port, "b", null, "--duration-ms", "30000")) {
+                    b.token();
 
-                List<String> aa = assignedPartitions(a.lines, "a");
-                List<String> bb = assignedPartitions(b.lines, "b");
-                // Complete, non-overlapping coverage across processes.
-                List<String> union = new ArrayList<>(aa);
-                union.addAll(bb);
-                assertEquals(4, union.size(), "union covers all partitions");
-                assertEquals(4, new java.util.HashSet<>(union).size(),
-                        "no partition claimed by two processes");
+                    // Wait until BOTH processes hold complementary partitions
+                    // and concurrently commit at the same generation.
+                    long deadline = System.currentTimeMillis() + 25_000;
+                    boolean settled = false;
+                    while (System.currentTimeMillis() < deadline) {
+                        List<String> aa = assignedPartitions(a.lines, "a");
+                        List<String> bb = assignedPartitions(b.lines, "b");
+                        java.util.Set<String> union = new java.util.HashSet<>(aa);
+                        union.addAll(bb);
+                        Integer ga = latestCommitGeneration(a.lines, "a");
+                        Integer gb = latestCommitGeneration(b.lines, "b");
+                        if (aa.size() == 2 && bb.size() == 2 && union.size() == 4
+                                && ga != null && ga.equals(gb)) {
+                            settled = true;
+                            break;
+                        }
+                        Thread.sleep(50);
+                    }
+                    assertTrue(settled, "both processes never held a common complementary "
+                            + "assignment; a=" + assignedPartitions(a.lines, "a")
+                            + " b=" + assignedPartitions(b.lines, "b"));
 
-                // Each committed on its own partitions.
-                for (String p : aa) {
-                    int id = Integer.parseInt(p.substring(1));
-                    String wanted = "COMMITTED\ta\t" + p + "\t";
-                    waitForLinePoll(a.lines, l -> l.startsWith(wanted), 15_000,
-                            "a commit on " + p);
-                    assertTrue(a.lines.stream().anyMatch(l ->
-                            l.startsWith("COMMITTED\ta\tp" + id + "\t")));
+                    List<String> aa = assignedPartitions(a.lines, "a");
+                    List<String> bb = assignedPartitions(b.lines, "b");
+                    java.util.Set<String> union = new java.util.HashSet<>(aa);
+                    union.addAll(bb);
+                    assertEquals(4, union.size(), "union covers all partitions");
+                    assertEquals(aa.size() + bb.size(), union.size(),
+                            "no partition claimed by two processes");
+
+                    for (String p : aa) {
+                        waitForLinePoll(a.lines,
+                                l -> l.startsWith("COMMITTED\ta\t" + p + "\t"),
+                                10_000, "a commit on " + p);
+                    }
+                    for (String p : bb) {
+                        waitForLinePoll(b.lines,
+                                l -> l.startsWith("COMMITTED\tb\t" + p + "\t"),
+                                10_000, "b commit on " + p);
+                    }
                 }
             }
         }
@@ -204,29 +242,48 @@ class MultiProcessIT {
     void deadProcessPartitionsAreTakenOverBySurvivor() throws Exception {
         try (Proc server = startServer(4, 100, 800, 5_000)) {
             int port = server.port();
-            Proc a = startConsumer(port, "a", null, "--duration-ms", "20000");
-            Proc b = startConsumer(port, "b", null, "--duration-ms", "20000");
-            try (a; b) {
-                a.token();
-                b.token();
-                waitForLinePoll(a.lines, l -> assignedPartitions(a.lines, "a").size() == 2,
-                        15_000, "a gets 2 partitions");
-                waitForLinePoll(b.lines, l -> assignedPartitions(b.lines, "b").size() == 2,
-                        15_000, "b gets 2 partitions");
+            // a comes up first and owns everything.
+            Proc a = startConsumer(port, "a", null, "--duration-ms", "30000");
+            try (a) {
+                waitForLinePoll(a.lines,
+                        l -> assignedPartitions(a.lines, "a").size() == 4
+                                && latestCommitGeneration(a.lines, "a") != null,
+                        15_000, "a owns all 4 before b joins");
 
-                // b crashes hard (no leave): kill the OS process.
-                b.process.destroyForcibly();
-                b.process.waitFor(10, TimeUnit.SECONDS);
+                Proc b = startConsumer(port, "b", null, "--duration-ms", "30000");
+                try (b) {
+                    b.token();
+                    // Reach a stable two-way split while both are alive.
+                    long settleDeadline = System.currentTimeMillis() + 20_000;
+                    boolean settled = false;
+                    while (System.currentTimeMillis() < settleDeadline) {
+                        List<String> aa = assignedPartitions(a.lines, "a");
+                        List<String> bb = assignedPartitions(b.lines, "b");
+                        Integer ga = latestCommitGeneration(a.lines, "a");
+                        Integer gb = latestCommitGeneration(b.lines, "b");
+                        if (aa.size() == 2 && bb.size() == 2 && ga != null && ga.equals(gb)) {
+                            settled = true;
+                            break;
+                        }
+                        Thread.sleep(50);
+                    }
+                    assertTrue(settled, "two-way split never stabilised before crash");
 
-                // After b's session expires and the generation closes, a takes
-                // over every partition and keeps committing on all four.
-                waitForLinePoll(a.lines, l -> assignedPartitions(a.lines, "a").size() == 4,
-                        20_000, "a takes over all 4 partitions after b crash");
-                for (int id = 0; id < 4; id++) {
-                    int pid = id;
+                    // b crashes hard (no leave): kill the OS process.
+                    b.process.destroyForcibly();
+                    b.process.waitFor(10, TimeUnit.SECONDS);
+
+                    // After b's session expires and the generation closes, a
+                    // takes over every partition and keeps committing on all 4.
                     waitForLinePoll(a.lines,
-                            l -> l.startsWith("COMMITTED\ta\tp" + pid + "\t"),
-                            20_000, "a commits on p" + pid);
+                            l -> assignedPartitions(a.lines, "a").size() == 4,
+                            20_000, "a takes over all 4 partitions after b crash");
+                    for (int id = 0; id < 4; id++) {
+                        int pid = id;
+                        waitForLinePoll(a.lines,
+                                l -> l.startsWith("COMMITTED\ta\tp" + pid + "\t"),
+                                20_000, "a commits on p" + pid);
+                    }
                 }
             }
         }
@@ -279,16 +336,19 @@ class MultiProcessIT {
         // Tight bound so the deterministic close is quick to observe.
         try (Proc server = startServer(4, 100, 60_000, 700)) {
             int port = server.port();
-            // Fast member joins and works.
+            // Fast member joins and works. In observe mode it keeps heartbeating
+            // through any rebalance but never issues phase 1 for it, so a
+            // straggler-driven window can only close at the time bound.
             Proc fast = startConsumer(port, "fast", null, "--duration-ms", "25000",
-                    "--poll-ms", "200");
+                    "--poll-ms", "200", "--observe-rebalance");
             try (fast) {
                 fast.token();
                 waitForLinePoll(fast.lines, l -> assignedPartitions(fast.lines, "fast").size() == 4,
                         15_000, "fast owns all 4 initially");
 
-                // Slow member performs phase 1 and never syncs: the generation
-                // stays open until the bound, then closes deterministically.
+                // Slow member performs phase 1, never finishes phase 2 and then
+                // goes silent (no heartbeats): the window can only close at the
+                // configured bound, never early.
                 Proc slow = startConsumer(port, "slow", null, "--slow-join",
                         "--duration-ms", "10000");
                 try (slow) {
@@ -296,19 +356,22 @@ class MultiProcessIT {
                     waitForLinePoll(slow.lines, l -> l.contains("SLOW"), 15_000,
                             "slow member completed phase 1 only");
 
-                    // The fast member sees the change in progress first.
+                    // The fast member observes an in-progress change first. This
+                    // is distinct from a failure: it keeps working/heartbeating.
                     waitForLinePoll(fast.lines, l -> l.startsWith("REBALANCING\tfast\t"),
                             15_000, "fast observes REBALANCING");
 
-                    // Bound elapses: the fast member rejoins and is told the
-                    // generation completed by timeout; slow (never rejoined) is
-                    // evicted; fast ends up owning everything again.
-                    waitForLinePoll(fast.lines, l -> l.startsWith("TIMEOUT-CLOSED\t"),
+                    // The window must not close before the bound (slow never
+                    // finishes phase 2). Then the bound elapses: the fast member
+                    // is told the generation completed by timeout and, because it
+                    // kept heartbeating, it survives and owns every partition
+                    // again; the silent slow member is evicted.
+                    waitForLinePoll(fast.lines, l -> l.contains("TIMEOUT-CLOSED"),
                             15_000, "fast observes TIMEOUT-CLOSED");
                     waitForLinePoll(fast.lines,
                             l -> assignedPartitions(fast.lines, "fast").size() == 4,
                             15_000, "fast owns all 4 after timeout close");
-                    // Fast member keeps committing: progress continues.
+                    // Fast member keeps committing after the deterministic close.
                     waitForLinePoll(fast.lines,
                             l -> l.startsWith("COMMITTED\tfast\tp3\t"),
                             15_000, "fast commits after timeout close");

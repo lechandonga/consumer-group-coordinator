@@ -104,7 +104,9 @@ class RebalanceProtocolTest {
         assertEquals(JoinStatus.IN_PROGRESS, bJoin.status());
         int openGen = bJoin.generation();
         assertTrue(openGen > a.generation());
-        assertEquals(Set.of("a"), c.pendingAwaiting());
+        // Neither member has finished phase 2 yet (b issued phase 1, a is the
+        // existing member the window is waiting for).
+        assertEquals(Set.of("a", "b"), c.pendingAwaiting());
 
         // 'a' still on the old generation sees the open window as in-progress,
         // which is distinguishable from a final rejection.
@@ -112,15 +114,17 @@ class RebalanceProtocolTest {
                 () -> c.heartbeat("a", a.instanceToken(), a.generation()));
         assertEquals(RejectionReason.REBALANCE_IN_PROGRESS, hb.reason());
 
-        // b syncing alone cannot close the window: the old member a must rejoin.
+        // b finishes phase 2 but a (the existing member) has not: still open.
         JoinResult bWaiting = c.syncGroup("b", bJoin.instanceToken(), openGen);
         assertEquals(JoinStatus.IN_PROGRESS, bWaiting.status());
+        assertEquals(Set.of("a"), c.pendingAwaiting());
 
-        // a performs phase 1 for the new generation -> window closes.
+        // a performs phase 1 AND phase 2 for the new generation -> window closes.
         JoinResult aRejoin = c.joinGroup("a", a.instanceToken());
-        assertEquals(JoinStatus.STABLE, aRejoin.status());
+        assertEquals(JoinStatus.IN_PROGRESS, aRejoin.status());
         JoinResult a2 = c.syncGroup("a", a.instanceToken(), openGen);
         JoinResult b = c.syncGroup("b", bJoin.instanceToken(), openGen);
+        assertEquals(JoinStatus.STABLE, a2.status());
         assertEquals(JoinStatus.STABLE, b.status());
         assertEquals(2, a2.assignment().size());
         assertEquals(2, b.assignment().size());
@@ -145,11 +149,18 @@ class RebalanceProtocolTest {
         assertEquals(RejectionReason.REBALANCE_IN_PROGRESS, commit.reason());
         assertEquals(7, c.fetchCommitted(p0), "in-progress commit must not mutate state");
 
-        // a rejoins -> closes; now an old-generation commit is a *final*
-        // failure (distinct reason), and b can progress on its partition.
+        // a performs phase 1 and both finish phase 2 -> window closes; now an
+        // old-generation commit is a *final* failure (distinct reason), and b
+        // can progress on its partition.
         c.joinGroup("a", a.instanceToken());
+        // b finishes phase 2 first but the window is still open (a not yet).
+        assertEquals(JoinStatus.IN_PROGRESS,
+                c.syncGroup("b", bJoin.instanceToken(), bJoin.generation()).status());
+        // a is the last to finish phase 2 -> the window closes.
+        JoinResult aStable = c.syncGroup("a", a.instanceToken(), bJoin.generation());
         JoinResult b = c.syncGroup("b", bJoin.instanceToken(), bJoin.generation());
         assertEquals(JoinStatus.STABLE, b.status());
+        assertEquals(JoinStatus.STABLE, aStable.status());
         CoordinatorException stale = assertThrows(CoordinatorException.class,
                 () -> c.commit("a", a.instanceToken(), a.generation(), p0, 8));
         assertEquals(RejectionReason.STALE_GENERATION, stale.reason());
@@ -171,27 +182,28 @@ class RebalanceProtocolTest {
         assertEquals(2, b.assignment().size());
         assertEquals(a2.generation(), b.generation());
 
-        // c arrives. Neither a nor b rejoins this generation.
+        // c arrives (phase 1). Nobody has finished phase 2 of the new window.
         JoinResult xJoin = c.joinGroup("c", null);
         assertEquals(JoinStatus.IN_PROGRESS, xJoin.status());
-        assertEquals(Set.of("a", "b"), c.pendingAwaiting());
+        assertEquals(Set.of("a", "b", "c"), c.pendingAwaiting());
         long deadline = c.rebalanceDeadlineMs();
         assertEquals(300, deadline - clock.getAsLong());
 
-        // Before the bound: still in progress, nothing finalized.
+        // c finishes phase 2 but a and b have not; before the bound the window
+        // is still open and nothing is finalized.
         clock.advance(299);
         JoinResult waiting = c.syncGroup("c", xJoin.instanceToken(), xJoin.generation());
         assertEquals(JoinStatus.IN_PROGRESS, waiting.status());
         assertEquals(GroupState.REBALANCING, c.state());
 
-        // Bound elapsed: deterministic, observable close.
+        // Bound elapsed: deterministic, observable close. a and b (silent, no
+        // sync and no renewal) are evicted; c owns everything.
         clock.advance(2);
         JoinResult closed = c.syncGroup("c", xJoin.instanceToken(), xJoin.generation());
         assertEquals(JoinStatus.STABLE, closed.status());
         assertTrue(closed.completedByTimeout(),
                 "close at the time bound must be flagged as timeout completion");
         assertTrue(c.lastCompletedByTimeout());
-        // a and b never joined the generation: evicted; c owns everything.
         assertEquals(Set.of("c"), c.members());
         assertEquals(4, closed.assignment().size());
         assertCompleteAndDisjoint(c, 4);
@@ -224,14 +236,16 @@ class RebalanceProtocolTest {
         GroupCoordinator c = newCoordinator(4, 200);
         JoinResult a = remember("a", bootstrap("a"));
         JoinResult bJoin = c.joinGroup("b", null);
-        c.joinGroup("a", a.instanceToken()); // stabilize b's generation
+        c.joinGroup("a", a.instanceToken());
+        c.syncGroup("a", a.instanceToken(), bJoin.generation());
         JoinResult b = remember("b", c.syncGroup("b", bJoin.instanceToken(), bJoin.generation()));
-        // c opens a window; only c participates in it (its join counts).
-        c.joinGroup("c", null);
+        // c opens gen3 and finishes phase 2; a and b never participate nor renew.
+        JoinResult cj = c.joinGroup("c", null);
+        c.syncGroup("c", cj.instanceToken(), cj.generation());
         clock.advance(250); // beyond the bound
         // The next ordinary request lazily closes the timed-out window; a and
-        // b (non-participants) were evicted and their old tokens are fenced, so
-        // the stale a process is told FENCED_INSTANCE (not silently unknown).
+        // b (silent) were evicted and their old tokens are fenced, so the stale
+        // a process is told FENCED_INSTANCE (not silently unknown).
         CoordinatorException e = assertThrows(CoordinatorException.class,
                 () -> c.heartbeat("a", a.instanceToken(), 1));
         assertEquals(RejectionReason.FENCED_INSTANCE, e.reason());
