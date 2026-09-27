@@ -379,4 +379,169 @@ class MultiProcessTest {
             }
         }
     }
+
+    private static List<String> combinedLines(Proc... procs) {
+        List<String> all = new ArrayList<>();
+        for (Proc p : procs) {
+            all.addAll(p.lines);
+        }
+        return all;
+    }
+
+    /** Like {@link #waitForLinePoll} but re-scans several live process logs. */
+    private static String waitForLineAny(long timeoutMs, String what, LinePred pred,
+                                         Proc... procs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            for (Proc p : procs) {
+                Optional<String> hit = p.lines.stream().filter(pred::test).findFirst();
+                if (hit.isPresent()) {
+                    return hit.get();
+                }
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted waiting for " + what);
+            }
+        }
+        throw new AssertionError("timed out waiting for " + what);
+    }
+
+    @Test
+    void simultaneousStartConsumersConvergeWithoutDying() throws Exception {
+        // Three consumer processes start at (almost) the same time: their
+        // phase-1 joins and phase-2 confirms interleave and supersede each
+        // other's windows. No process may die because of this; all must end
+        // up with a complete, non-overlapping assignment and keep committing.
+        try (Proc server = startServer(6, 100, 60_000, 2_000)) {
+            int port = server.port();
+            Proc a = startConsumer(port, "a", null, "--duration-ms", "30000");
+            Proc b = startConsumer(port, "b", null, "--duration-ms", "30000");
+            Proc c = startConsumer(port, "c", null, "--duration-ms", "30000");
+            try (a; b; c) {
+                // The interleaving must be observable as in-progress
+                // (REBALANCING), which is distinct from a final failure.
+                waitForLineAny(20_000, "some member observes the in-progress rebalance",
+                        l -> l.startsWith("REBALANCING\t"), a, b, c);
+
+                // Converge: 2 partitions each, union covers all 6, and every
+                // process commits at a common generation.
+                long deadline = System.currentTimeMillis() + 30_000;
+                boolean settled = false;
+                while (System.currentTimeMillis() < deadline) {
+                    List<String> pa = assignedPartitions(a.lines, "a");
+                    List<String> pb = assignedPartitions(b.lines, "b");
+                    List<String> pc = assignedPartitions(c.lines, "c");
+                    java.util.Set<String> union = new java.util.HashSet<>(pa);
+                    union.addAll(pb);
+                    union.addAll(pc);
+                    Integer ga = latestCommitGeneration(a.lines, "a");
+                    Integer gb = latestCommitGeneration(b.lines, "b");
+                    Integer gc = latestCommitGeneration(c.lines, "c");
+                    if (pa.size() == 2 && pb.size() == 2 && pc.size() == 2
+                            && union.size() == 6
+                            && ga != null && ga.equals(gb) && gb.equals(gc)) {
+                        settled = true;
+                        break;
+                    }
+                    Thread.sleep(50);
+                }
+                assertTrue(settled, "simultaneous starters never converged: a="
+                        + assignedPartitions(a.lines, "a") + " b="
+                        + assignedPartitions(b.lines, "b") + " c="
+                        + assignedPartitions(c.lines, "c"));
+
+                // Nobody died because of the interleaving, and nobody logged
+                // an uncaught exception.
+                assertTrue(a.process.isAlive(), "consumer a exited unexpectedly");
+                assertTrue(b.process.isAlive(), "consumer b exited unexpectedly");
+                assertTrue(c.process.isAlive(), "consumer c exited unexpectedly");
+                for (String line : combinedLines(a, b, c)) {
+                    assertTrue(!line.contains("Exception") && !line.contains("Error"),
+                            "unexpected crash output: " + line);
+                }
+
+                // Complete and disjoint right now.
+                List<String> pa = assignedPartitions(a.lines, "a");
+                List<String> pb = assignedPartitions(b.lines, "b");
+                List<String> pc = assignedPartitions(c.lines, "c");
+                java.util.Set<String> union = new java.util.HashSet<>(pa);
+                union.addAll(pb);
+                union.addAll(pc);
+                assertEquals(6, union.size(), "union covers all partitions");
+                assertEquals(pa.size() + pb.size() + pc.size(), union.size(),
+                        "no partition claimed by two processes");
+            }
+        }
+    }
+
+    @Test
+    void restartInterleavedWithAnotherMembersChangeConverges() throws Exception {
+        // A restart (same member id, fresh instance) lands at the same time as
+        // an unrelated new member joins: the two membership changes interleave.
+        // The old instance must be permanently fenced (and exit), the new
+        // instance and the newcomer must converge to a complete, disjoint
+        // assignment and keep committing; nobody crashes.
+        try (Proc server = startServer(4, 100, 60_000, 2_000)) {
+            int port = server.port();
+            Proc oldA = startConsumer(port, "a", null, "--duration-ms", "30000",
+                    "--poll-ms", "100");
+            try (oldA) {
+                String oldToken = oldA.token();
+                waitForLinePoll(oldA.lines,
+                        l -> assignedPartitions(oldA.lines, "a").size() == 4
+                                && latestCommitGeneration(oldA.lines, "a") != null,
+                        15_000, "a owns all 4 before the interleaved change");
+
+                // Fire both changes at (almost) the same time: a new instance
+                // of a, and a brand-new member b.
+                Proc newA = startConsumer(port, "a", null, "--duration-ms", "30000");
+                Proc b = startConsumer(port, "b", null, "--duration-ms", "30000");
+                try (newA; b) {
+                    String newToken = newA.token();
+                    assertNotEquals(oldToken, newToken);
+
+                    // The superseded old instance is explicitly fenced and
+                    // stops with the dedicated exit code; it never sneaks back.
+                    waitForLinePoll(oldA.lines, l -> l.contains("FENCED_INSTANCE"),
+                            20_000, "old instance observes FENCED_INSTANCE");
+                    waitForLinePoll(oldA.lines, l -> l.startsWith("FENCED\ta"),
+                            20_000, "old instance emits FENCED");
+                    assertTrue(oldA.process.waitFor(20, TimeUnit.SECONDS));
+                    assertEquals(3, oldA.process.exitValue(),
+                            "fenced old instance must exit with code 3");
+
+                    // The survivors converge: 2 partitions each, union covers
+                    // all 4, both commit at a common generation.
+                    long deadline = System.currentTimeMillis() + 30_000;
+                    boolean settled = false;
+                    while (System.currentTimeMillis() < deadline) {
+                        List<String> pa = assignedPartitions(newA.lines, "a");
+                        List<String> pb = assignedPartitions(b.lines, "b");
+                        java.util.Set<String> union = new java.util.HashSet<>(pa);
+                        union.addAll(pb);
+                        Integer ga = latestCommitGeneration(newA.lines, "a");
+                        Integer gb = latestCommitGeneration(b.lines, "b");
+                        if (pa.size() == 2 && pb.size() == 2 && union.size() == 4
+                                && ga != null && ga.equals(gb)) {
+                            settled = true;
+                            break;
+                        }
+                        Thread.sleep(50);
+                    }
+                    assertTrue(settled, "new a and b never converged: a="
+                            + assignedPartitions(newA.lines, "a") + " b="
+                            + assignedPartitions(b.lines, "b"));
+                    assertTrue(newA.process.isAlive(), "new a exited unexpectedly");
+                    assertTrue(b.process.isAlive(), "b exited unexpectedly");
+                    for (String line : combinedLines(newA, b)) {
+                        assertTrue(!line.contains("Exception") && !line.contains("Error"),
+                                "unexpected crash output: " + line);
+                    }
+                }
+            }
+        }
+    }
 }

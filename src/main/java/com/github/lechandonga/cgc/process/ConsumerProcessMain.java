@@ -135,13 +135,42 @@ public final class ConsumerProcessMain {
     /** Phase 1 + phase 2 with bounded retries while the window is IN_PROGRESS. */
     private static Session joinAndSync(CoordinatorClient client, String memberId,
                                        String providedToken, boolean slowJoin) throws Exception {
+        // Outer retry: while several members join/change at almost the same
+        // time, the window a member is confirming can be superseded or closed
+        // under it. That is an in-progress situation, not a reason to die:
+        // re-issue phase 1 and keep going. Only fencing is terminal.
+        String nextToken = providedToken;
+        for (long attempt = 0; attempt < 10_000; attempt++) {
+            try {
+                return joinAndSyncOnce(client, memberId, nextToken, slowJoin);
+            } catch (CoordinatorException e) {
+                System.out.println("REJECTED\tSYNC\t" + e.reason().name());
+                System.out.flush();
+                if (e.reason() == RejectionReason.FENCED_INSTANCE) {
+                    return null; // permanently retired instance: stop, do not die
+                }
+                // Evicted instances re-enter as fresh instances; anything else
+                // retries phase 1 carrying the current token.
+                nextToken = e.reason() == RejectionReason.UNKNOWN_MEMBER ? null : nextToken;
+                Thread.sleep(20);
+            }
+        }
+        throw new IllegalStateException("join did not converge");
+    }
+
+    private static Session joinAndSyncOnce(CoordinatorClient client, String memberId,
+                                           String providedToken, boolean slowJoin)
+            throws Exception {
         JoinResult joined;
         try {
             joined = client.joinGroup(memberId, providedToken);
         } catch (CoordinatorException e) {
             System.out.println("REJECTED\tJOIN\t" + e.reason().name());
             System.out.flush();
-            return null;
+            if (e.reason() == RejectionReason.FENCED_INSTANCE) {
+                return null; // rejection already logged
+            }
+            throw e; // transient: the outer retry re-issues phase 1
         }
         System.out.println("TOKEN\t" + joined.instanceToken());
         System.out.flush();
@@ -160,10 +189,14 @@ public final class ConsumerProcessMain {
         long guard = 0;
         while (synced.status() == JoinStatus.IN_PROGRESS) {
             guard++;
-            System.out.println("REBALANCING\t" + memberId + "\t" + joined.generation());
+            System.out.println("REBALANCING\t" + memberId + "\t" + synced.generation());
             System.out.flush();
             Thread.sleep(20);
-            synced = client.syncGroup(memberId, session.token, joined.generation());
+            // Always confirm the newest generation the coordinator told us
+            // about: while this member waits, a newer membership change can
+            // supersede the window it had joined, and the IN_PROGRESS result
+            // carries the generation that is open now.
+            synced = client.syncGroup(memberId, session.token, synced.generation());
             if (guard > 100_000) {
                 throw new IllegalStateException("sync loop did not terminate");
             }
@@ -404,7 +437,10 @@ public final class ConsumerProcessMain {
                 throw new IllegalStateException("rejoin sync loop did not terminate");
             }
             Thread.sleep(10);
-            synced = client.syncGroup(memberId, session.token, joined.generation());
+            // Confirm the newest generation reported by the coordinator: the
+            // window may have been superseded by a concurrent membership
+            // change while this member was waiting for it to close.
+            synced = client.syncGroup(memberId, session.token, synced.generation());
         }
         session.token = synced.instanceToken();
         applyAssignment(session, synced, client);

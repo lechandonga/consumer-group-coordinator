@@ -150,6 +150,33 @@ java -cp target/classes com.github.lechandonga.cgc.process.ConsumerProcessMain 1
 改大，调用方能在更长时间内持续观察到 `IN_PROGRESS`。单测
 `timeoutValueChangesBehavior` 用注入时钟对同一场景取两个上界值直接断言这一点。
 
+### 成员变化交错：同时加入 / 重启撞车
+
+多个成员几乎同时加入、或一个重启实例刚好撞上别的成员变化时，一个成员正在
+确认的窗口可能**被更新的成员变化取代**（窗口尚未关闭就被新一代窗口顶替），
+或**在它确认之前就已关闭并被超越**。这两种情况都被识别为“成员变化还在
+进行中”，而不是最终失败：
+
+- **窗口被取代**：成员对自己已加入的那一代发 `SYNC` 时，若该代窗口已被
+  更新的窗口顶替，协调器把它**吸收进当前开放的窗口**（视为已参与当前代），
+  返回 `IN_PROGRESS` 且**携带当前开放的代数**。调用方据此继续确认最新代，
+  不会收到 `STALE_GENERATION` 这样的最终失败，进程更不会因此退出。
+  （注意：确认一个自己**从未参与过**的更老代数仍然是 `STALE_GENERATION`
+  最终失败——“进行中”只覆盖成员真实参与过、被交错打断的那一轮。）
+- **确认落在收场之后**：成员带着旧代数确认时，若它注册且实例身份当前有效
+  （即它活过了那次收场、属于当前稳定代），协调器直接返回**当前稳定代的
+  归属**；被剔除的成员不会走到这一步（它是 `UNKNOWN_MEMBER` /
+  `FENCED_INSTANCE`）。
+- **上界依然有效**：取代链不延长任何单个窗口的上界；每个窗口到
+  `rebalanceTimeoutMs` 仍确定性收场，不会让人永远卡在“进行中”。
+- **栅栏不受交错影响**：被顶替/被剔除的旧实例在这些路径上依然得到
+  `FENCED_INSTANCE`，无法顺着“进行中”重新拿到分区或推进位点；同一 id 的
+  新实例干净接管。
+
+消费者进程侧的配合：确认循环总是携带**协调器最近一次告知的代数**（而不是
+第 1 阶段返回时的旧代数），并且在确认路径上遇到可重试拒绝时重新发起第 1
+阶段而不是退出——只有 `FENCED_INSTANCE` 是终止性的。
+
 ### 实例身份与“换了实例”的可判定
 
 每个多进程成员在入组时获得一个不透明 **实例 token**；心跳、提交、离开都必须
@@ -183,7 +210,20 @@ java -cp target/classes com.github.lechandonga.cgc.process.ConsumerProcessMain 1
 mvn test
 ```
 
-测试覆盖（46 个用例）：
+只复现“成员变化交错”相关行为（注入时钟的确定性用例 + 真实多进程用例）：
+
+```bash
+mvn test -Dtest='InterleavedMembershipTest'
+mvn test -Dtest='MultiProcessTest#simultaneousStartConsumersConvergeWithoutDying'
+mvn test -Dtest='MultiProcessTest#restartInterleavedWithAnotherMembersChangeConverges'
+```
+
+手工观察（三个消费者几乎同时启动）：先启动协调器进程，再在后台同时拉起
+三个消费者进程（命令见上文两节，member id 分别取 a/b/c）；可在消费者输出中
+看到先出现的 `REBALANCING <id> <旧代>`（窗口被取代，进行中、可重试）随后
+`JOINED`/`ASSIGNED` 收敛到同一代，无任何进程异常退出。
+
+测试覆盖（53 个用例）：
 
 | 测试类 | 覆盖场景 |
 | --- | --- |
@@ -191,8 +231,9 @@ mvn test
 | `OffsetCommitStoreTest` | 提交持久化、重启恢复、撕裂尾部截断、CRC 损坏丢弃、位点倒退拒绝 |
 | `GroupCoordinatorTest` | 加入/退出/过期触发再均衡、分配完整且不重叠、各类代数栅栏拒绝、归属区间审计 |
 | `RebalanceProtocolTest` | 两阶段入组、`IN_PROGRESS` 与最终失败可区分、上界到期确定性收场（含超时标志）、参数取不同值行为不同、被顶替/超时剔除的旧实例 `FENCED_INSTANCE`、新实例干净接管（注入时钟，完全确定） |
+| `InterleavedMembershipTest` | 成员变化交错（注入时钟，完全确定）：确认被取代的窗口得到可重试 `IN_PROGRESS`（携带当前开放代）而非最终失败；同时加入的取代链收敛为完整不重叠归属；收场后活着的成员确认旧代拿到当前归属；上界对取代链仍确定性收场；被顶替/被剔除旧实例在交错中仍 `FENCED_INSTANCE`、新实例干净接管 |
 | `server.TcpProtocolIntegrationTest` | 同 JVM 内真实 loopback TCP：多连接共享分区、归属不重叠、越权提交拒绝、接管、旧连接被 fence、超时关闭 |
-| `process.MultiProcessTest` | **独立 OS 进程**：多进程加入/提交/完整覆盖；某进程被 kill 后幸存者接走其分区并继续；新实例接管、旧进程持续心跳/提交被 `FENCED_INSTANCE` 拒绝并以码 3 退出；慢成员拖到上界、观察者先见 `REBALANCING` 后见 `TIMEOUT-CLOSED` |
+| `process.MultiProcessTest` | **独立 OS 进程**：多进程加入/提交/完整覆盖；某进程被 kill 后幸存者接走其分区并继续；新实例接管、旧进程持续心跳/提交被 `FENCED_INSTANCE` 拒绝并以码 3 退出；慢成员拖到上界、观察者先见 `REBALANCING` 后见 `TIMEOUT-CLOSED`；**三个消费者几乎同时启动**（窗口互相取代）无进程退出、收敛为完整不重叠归属且都能继续提交、`REBALANCING` 可观察；**重启实例与另一成员加入交错**时旧实例被栅栏退出、新实例与新成员收敛 |
 | `CrashRecoveryTest` | 成员崩溃→会话过期→同 id 重启后从已确认位点恢复；幸存成员持续接管全部分区 |
 | `ConcurrencyTest` | 并发提交 × 再均衡 × 崩溃重启风暴（固定随机种子可复现）：位点单调、归属无重叠、无丢失更新 |
 
@@ -201,6 +242,8 @@ mvn test
 1. 再均衡后各成员分区集合完整覆盖全部分区且互不重叠，跨进程亦然；
 2. `verifyNoOwnershipOverlap()` 恒为真——任何时刻不存在两个有效归属；
 3. 成员变化进行中只能观察到 `IN_PROGRESS`（可重试），收场有确定结论与上界；
+   变化交错时，确认被取代/已超越轮次的请求同样得到可重试的进行中结果或当前
+   稳定归属，而不是最终失败；
 4. 被顶替/失效的旧实例在任意代数、任意状态下都得到 `FENCED_INSTANCE`，无法
    占用分区或推进位点；新实例可干净接管；
 5. 已确认位点单调不减，任何成员的本地进度不超过已确认位点；

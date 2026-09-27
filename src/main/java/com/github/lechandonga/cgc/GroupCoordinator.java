@@ -334,6 +334,26 @@ public class GroupCoordinator implements AutoCloseable {
         if (state == GroupState.REBALANCING) {
             if (gen != pending.generation) {
                 if (gen < pending.generation) {
+                    if (gen == member.knownGeneration) {
+                        // The window this member had joined was superseded by a
+                        // newer membership change before it could finish phase 2
+                        // (several members joined / changed at almost the same
+                        // time). The member is alive and current: this is an
+                        // in-progress situation, NOT a final failure. Absorb the
+                        // member into the window that is open now and report
+                        // IN_PROGRESS for it, so the caller keeps retrying
+                        // instead of failing (and its process stays alive).
+                        member.lastHeartbeatMs = clock.getAsLong();
+                        member.knownGeneration = pending.generation;
+                        pending.rejoined.add(memberId);
+                        pending.synced.add(memberId);
+                        tryCompletePending(false);
+                        if (state == GroupState.REBALANCING) {
+                            return JoinResult.inProgress(pending.generation, token);
+                        }
+                        return stableResult(memberId, token);
+                    }
+                    // A generation this member never participated in: final.
                     throw new CoordinatorException(RejectionReason.STALE_GENERATION,
                             "member '" + memberId + "' synced stale generation " + gen
                                     + ", current rebalance generation is " + pending.generation);
@@ -353,6 +373,17 @@ public class GroupCoordinator implements AutoCloseable {
             return stableResult(memberId, token);
         }
         maybeTimeoutPending();
+        if (gen < this.generation) {
+            // The generation the caller was confirming is already closed and
+            // superseded, but the caller itself is registered and current (its
+            // token just authorized), so it survived into the stable generation
+            // that is installed right now. Answer with the current assignment
+            // instead of a final STALE_GENERATION: a live member must always be
+            // able to learn its share and keep committing, no matter how the
+            // membership changes interleaved. (A member evicted at the close
+            // never reaches here: it is UNKNOWN_MEMBER / FENCED_INSTANCE above.)
+            return stableResult(memberId, token);
+        }
         checkGeneration(memberId, gen);
         return stableResult(memberId, token);
     }
